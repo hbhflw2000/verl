@@ -327,7 +327,16 @@ class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):
             logger.info(f"vLLM-Omni load weights, loaded_params: {len(weights)}")
         else:
             logger.info("Loading standard weights (async)")
-            self.load_weights(weights)
+            model_runner = getattr(self, "model_runner", None)
+            model = getattr(model_runner, "model", None)
+            if model is not None and hasattr(model, "load_weights"):
+                loaded_params = model.load_weights(weights)
+                logger.info(f"vLLM-Omni load standard weights, loaded_params: {len(loaded_params)}")
+            elif hasattr(self, "reload_weights"):
+                self.reload_weights(weights_iterator=weights)
+                logger.info(f"vLLM-Omni reloaded standard weights, num_tensors: {len(weights)}")
+            else:
+                raise AttributeError("vLLM-Omni worker has neither model.load_weights nor reload_weights")
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""

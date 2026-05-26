@@ -40,6 +40,9 @@ gpu_memory_utilization: 0.5
 # Whether to ignore EOS and continue generating after EOS is hit.
 ignore_eos: False
 
+# Minimum generated tokens before EOS/stop tokens are allowed.
+min_tokens: 0
+
 # Whether to disable CUDA graph. Default False to best performance.
 enforce_eager: False
 

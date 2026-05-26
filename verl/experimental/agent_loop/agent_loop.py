@@ -551,7 +551,12 @@ class AgentLoopWorker:
             top_k=config.top_k,
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
+            ignore_eos=config.ignore_eos,
+            max_tokens=config.response_length,
         )
+        min_tokens = getattr(config, "min_tokens", 0)
+        if min_tokens > 0:
+            sampling_params["min_tokens"] = min_tokens
 
         # override sampling params for validation
         if batch.meta_info.get("validate", False):

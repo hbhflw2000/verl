@@ -56,6 +56,7 @@ from verl.utils.import_utils import deprecated
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
 from verl.utils.megatron_peft_utils import add_base_layer_suffix, build_peft_config_for_vllm
 from verl.utils.megatron_utils import (
+    get_hf_text_config,
     load_megatron_model_to_gpu,
     load_megatron_optimizer,
     offload_megatron_model_to_cpu,
@@ -151,7 +152,10 @@ class MegatronWorker(Worker):
             "pad_token_id": self.tokenizer.pad_token_id,
         }
         override_config_kwargs.update(override_model_config.get("model_config", {}))
-        self.share_embeddings_and_output_weights = getattr(hf_config, "tie_word_embeddings", False)
+        text_config = get_hf_text_config(hf_config)
+        self.share_embeddings_and_output_weights = getattr(
+            text_config, "tie_word_embeddings", getattr(hf_config, "tie_word_embeddings", False)
+        )
 
         # only actor need enable mtp
         if enable_mtp:

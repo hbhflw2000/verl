@@ -14,7 +14,28 @@
 
 from typing import Callable
 
+import torch
+
 _index_first_axis, _pad_input, _rearrange, _unpad_input = None, None, None, None
+
+
+def _torch_index_first_axis(input_tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    return input_tensor[indices]
+
+
+def _torch_pad_input(hidden_states: torch.Tensor, indices: torch.Tensor, batch: int, seqlen: int) -> torch.Tensor:
+    output_shape = (batch * seqlen, *hidden_states.shape[1:])
+    output = hidden_states.new_zeros(output_shape)
+    output[indices] = hidden_states
+    return output.reshape(batch, seqlen, *hidden_states.shape[1:])
+
+
+def _torch_unpad_input(hidden_states: torch.Tensor, attention_mask: torch.Tensor):
+    seqlens = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    cu_seqlens = torch.nn.functional.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
+    max_seqlen = int(seqlens.max().item()) if seqlens.numel() > 0 else 0
+    return _torch_index_first_axis(hidden_states.reshape(-1, *hidden_states.shape[2:]), indices), indices, cu_seqlens, max_seqlen
 
 
 def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
@@ -27,7 +48,14 @@ def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
     if is_torch_npu_available(check_device=False):
         from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, rearrange, unpad_input
     else:
-        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        try:
+            from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        except ModuleNotFoundError:
+            from einops import rearrange
+
+            index_first_axis = _torch_index_first_axis
+            pad_input = _torch_pad_input
+            unpad_input = _torch_unpad_input
 
     _index_first_axis, _pad_input, _rearrange, _unpad_input = index_first_axis, pad_input, rearrange, unpad_input
 

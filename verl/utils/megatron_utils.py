@@ -56,6 +56,16 @@ def get_model_config(model):
     return get_attr_wrapped_model(model, "config", allow_none=False)
 
 
+def get_hf_text_config(hf_config: PretrainedConfig) -> PretrainedConfig:
+    """Return the language-model config nested inside multimodal HF configs."""
+    if hasattr(hf_config, "text_config"):
+        return hf_config.text_config
+    thinker_config = getattr(hf_config, "thinker_config", None)
+    if thinker_config is not None and hasattr(thinker_config, "text_config"):
+        return thinker_config.text_config
+    return hf_config
+
+
 def get_model(
     model_provider_func,
     model_type=ModelType.encoder_or_decoder,
@@ -180,15 +190,16 @@ def get_hf_rope_theta(hf_config: PretrainedConfig) -> float:
     # For transformers <= 4.57.6
     if hasattr(hf_config, "rope_theta"):
         return hf_config.rope_theta
-    if hasattr(hf_config, "text_config") and hasattr(hf_config.text_config, "rope_theta"):
-        return hf_config.text_config.rope_theta
+    text_config = get_hf_text_config(hf_config)
+    if text_config is not hf_config and hasattr(text_config, "rope_theta"):
+        return text_config.rope_theta
 
     # For transformers >= 5.0.0, check rope_parameters dict (optionally nested) for rope_theta
     rp = None
     if hasattr(hf_config, "rope_parameters"):
         rp = hf_config.rope_parameters
-    elif hasattr(hf_config, "text_config") and hasattr(hf_config.text_config, "rope_parameters"):
-        rp = hf_config.text_config.rope_parameters
+    elif text_config is not hf_config and hasattr(text_config, "rope_parameters"):
+        rp = text_config.rope_parameters
     if isinstance(rp, dict):
         if "rope_theta" in rp:
             return rp["rope_theta"]
@@ -237,9 +248,7 @@ def make_megatron_module(
         else:
             from verl.models.mcore.bridge import freeze_moe_router, make_value_model
 
-            hidden_size = (
-                hf_config.text_config.hidden_size if hasattr(hf_config, "text_config") else hf_config.hidden_size
-            )
+            hidden_size = get_hf_text_config(hf_config).hidden_size
             value_model_hook = make_value_model(hidden_size, provider.sequence_parallel)
 
         post_model_creation_callbacks = []
