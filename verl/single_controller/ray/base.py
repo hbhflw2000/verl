@@ -36,6 +36,14 @@ __all__ = ["Worker"]
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+_WORKER_ENV_PASSTHROUGH_KEYS = (
+    "HYDRA_FULL_ERROR",
+    "NVTE_DEBUG",
+    "NVTE_DEBUG_LEVEL",
+    "NVTE_PRINT_RANK",
+    "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
+)
+
 
 def get_random_string(length: int) -> str:
     import random
@@ -632,6 +640,9 @@ class RayWorkerGroup(WorkerGroup):
             "MASTER_ADDR": self._master_addr,
             "MASTER_PORT": self._master_port,
         }
+        passthrough_env = {
+            key: os.environ[key] for key in _WORKER_ENV_PASSTHROUGH_KEYS if os.environ.get(key) is not None
+        }
         if worker_env is not None:
             logging.debug(f"Appending ray class env, origin: {env_vars}, customized env: {worker_env}")
             conflict_env_vars = set(env_vars.keys()) & set(worker_env.keys())
@@ -642,6 +653,8 @@ class RayWorkerGroup(WorkerGroup):
                 )
                 raise ValueError(f"Cannot override protected system env: {conflict_env_vars}")
             env_vars.update(worker_env)
+        for key, value in passthrough_env.items():
+            env_vars.setdefault(key, value)
         import re
 
         cia_name = type(ray_cls_with_init.cls).__name__

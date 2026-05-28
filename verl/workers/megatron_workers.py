@@ -710,6 +710,31 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         aggressive_empty_cache(force_sync=True)
         set_expandable_segments(False)
 
+        skip_weight_update = os.getenv("VERL_OMNI_SKIP_WEIGHT_UPDATE", "0").lower()
+        weight_sync_debug = os.getenv("VERL_OMNI_WEIGHT_SYNC_DEBUG", "0").lower() in {"1", "true", "yes"}
+        rollout_name = self.config.rollout.name
+        if weight_sync_debug:
+            logger.warning(
+                "Megatron rollout_mode entry: rollout_name=%s rollout_mode=%s rollout_cls=%s "
+                "rollout_module=%s global_rank=%s VERL_OMNI_SKIP_WEIGHT_UPDATE=%s",
+                rollout_name,
+                self.config.rollout.mode,
+                type(self.rollout).__name__ if hasattr(self, "rollout") else None,
+                type(self.rollout).__module__ if hasattr(self, "rollout") else None,
+                self.rank,
+                skip_weight_update,
+            )
+        if rollout_name == "vllm_omni" and skip_weight_update in {"1", "true", "yes"}:
+            if weight_sync_debug:
+                logger.warning(
+                    "Skipping Megatron->vLLM-Omni rollout_mode weight sync before export due to "
+                    "VERL_OMNI_SKIP_WEIGHT_UPDATE; rank=%s rollout_cls=%s",
+                    self.rank,
+                    type(self.rollout).__name__ if hasattr(self, "rollout") else None,
+                )
+            set_expandable_segments(True)
+            return
+
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
             log_gpu_memory_usage("After load actor params during rollout_mode", logger=logger)
@@ -767,6 +792,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             # Mark base sync as done after first successful sync
             self.base_sync_done = True
 
+        if weight_sync_debug:
+            logger.warning(
+                "Megatron rollout_mode calling rollout.update_weights: rank=%s rollout_cls=%s "
+                "peft_config=%s base_sync_done=True",
+                self.rank,
+                type(self.rollout).__name__,
+                peft_config is not None,
+            )
         await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=True)
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor.actor_module)

@@ -670,6 +670,34 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         base weights before sync. The engine returns full HF-keyed params with
         peft_config=None, so the rollout receives a standard weight update.
         """
+        rollout_name = getattr(self.config.rollout, "name", None)
+        skip_weight_update = os.getenv("VERL_OMNI_SKIP_WEIGHT_UPDATE", "0").lower() in {"1", "true", "yes"}
+        skip_initial_rollout_resume = (
+            os.getenv("VERL_OMNI_SKIP_INITIAL_ROLLOUT_RESUME", "0").lower() in {"1", "true", "yes"}
+        )
+        weight_sync_debug = os.getenv("VERL_OMNI_WEIGHT_SYNC_DEBUG", "0").lower() in {"1", "true", "yes"}
+        if weight_sync_debug:
+            print(
+                "[verl_omni_weight_sync] EngineWorker.update_weights entry "
+                f"rollout={rollout_name} backend={self.config.rollout.checkpoint_engine.backend} "
+                f"global_steps={global_steps} skip={skip_weight_update} "
+                f"skip_initial_resume={skip_initial_rollout_resume} free_cache={self.config.rollout.free_cache_engine}",
+                flush=True,
+            )
+
+        if (
+            rollout_name == "vllm_omni"
+            and skip_weight_update
+            and skip_initial_rollout_resume
+            and global_steps == 0
+        ):
+            if weight_sync_debug:
+                print(
+                    "[verl_omni_weight_sync] EngineWorker skipping initial vLLM-Omni rollout resume/update "
+                    "due to VERL_OMNI_SKIP_INITIAL_ROLLOUT_RESUME=1; rollout keeps cold-loaded state.",
+                    flush=True,
+                )
+            return
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if self.config.rollout.checkpoint_engine.backend != "naive":
@@ -684,6 +712,34 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
         log_gpu_memory_usage("After resume weights", logger=logger)
+
+        if (
+            rollout_name == "vllm_omni"
+            and os.getenv("VERL_OMNI_PRE_IPC_LOCAL_COPY_DEBUG", "0").lower() in {"1", "true", "yes"}
+            and hasattr(self.rollout, "probe_weight_update_local_copy")
+        ):
+            target_name = os.getenv("VERL_OMNI_WEIGHT_SYNC_TARGET_NAME", "thinker.audio_tower.conv2d1.bias")
+            await self.rollout.probe_weight_update_local_copy(
+                target_name=target_name,
+                event=f"pre_ipc_local_copy_step_{global_steps}",
+            )
+
+        if rollout_name == "vllm_omni" and skip_weight_update:
+            if weight_sync_debug:
+                print(
+                    "[verl_omni_weight_sync] EngineWorker skipping Megatron export and rollout.update_weights "
+                    "due to VERL_OMNI_SKIP_WEIGHT_UPDATE=1; rollout keeps checkpoint weights.",
+                    flush=True,
+                )
+            if self.actor.engine.is_param_offload_enabled:
+                self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+            aggressive_empty_cache(force_sync=True)
+            if self.config.rollout.free_cache_engine:
+                await self.rollout.resume(tags=["kv_cache"])
+            log_gpu_memory_usage("After skipped update_weights resume kv_cache", logger=logger)
+            self.base_sync_done = True
+            set_expandable_segments(True)
+            return
 
         # 2. determine if we need a base weight sync (adapter path only)
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(

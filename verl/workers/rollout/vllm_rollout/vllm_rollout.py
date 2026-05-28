@@ -93,6 +93,12 @@ class ServerAdapter(BaseRollout):
             self.sleep_level = 1
         else:
             self.sleep_level = VLLM_SLEEP_LEVEL
+        sleep_level_override = os.getenv("VERL_OMNI_SLEEP_LEVEL", "").strip()
+        if self.config.name == "vllm_omni" and sleep_level_override:
+            if sleep_level_override not in {"1", "2"}:
+                raise ValueError(f"VERL_OMNI_SLEEP_LEVEL must be 1 or 2, got {sleep_level_override!r}")
+            self.sleep_level = int(sleep_level_override)
+            logger.warning("Overriding vLLM-Omni sleep level to %s via VERL_OMNI_SLEEP_LEVEL.", self.sleep_level)
 
         self.device_uuid = get_device_uuid(get_device_id())
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{self.device_uuid}.sock"
@@ -137,12 +143,29 @@ class ServerAdapter(BaseRollout):
         future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
         return future if non_block else await future
 
-    async def resume(self, tags: list[str]):
+    async def resume(self, tags: list[str] | None):
         """Resume rollout weights or kv cache in GPU memory.
 
         Args:
             tags: weights or kv_cache.
         """
+        wake_tags_override = os.getenv("VERL_OMNI_WAKE_TAGS", "").strip()
+        if self.config.name == "vllm_omni" and wake_tags_override:
+            normalized_wake_tags = wake_tags_override.lower()
+            if normalized_wake_tags in {"none", "null", "default"}:
+                tags = None
+            else:
+                tags = [tag.strip() for tag in wake_tags_override.split(",") if tag.strip()]
+        elif self.config.name == "vllm_omni" and tags == ["weights"]:
+            tags = ["kv_cache", "weights"]
+
+        if os.getenv("VERL_OMNI_WEIGHT_SYNC_DEBUG", "0").lower() in {"1", "true", "yes"}:
+            print(
+                "[verl_omni_weight_sync] ServerAdapter.resume "
+                f"rollout={self.config.name} replica={self.replica_rank} "
+                f"rollout_rank={self.rollout_rank} tags={tags} wake_tags_override={wake_tags_override or '<unset>'}",
+                flush=True,
+            )
         if self.config.free_cache_engine:
             await self._execute_method("wake_up", kwargs={"tags": tags})
 
@@ -151,11 +174,68 @@ class ServerAdapter(BaseRollout):
         if self.config.free_cache_engine:
             await self._execute_method("sleep", kwargs={"level": self.sleep_level})
 
+    async def probe_weight_update_local_copy(self, target_name: str | None = None, event: str = "pre_ipc_local_copy"):
+        """Debug probe for vLLM-Omni parameter writability after wake and before IPC update."""
+
+        if self.config.name != "vllm_omni":
+            return None
+        if os.getenv("VERL_OMNI_PRE_IPC_LOCAL_COPY_DEBUG", "0").lower() not in {"1", "true", "yes"}:
+            return None
+        target_name = target_name or os.getenv(
+            "VERL_OMNI_WEIGHT_SYNC_TARGET_NAME", "thinker.audio_tower.conv2d1.bias"
+        )
+        if os.getenv("VERL_OMNI_WEIGHT_SYNC_DEBUG", "0").lower() in {"1", "true", "yes"}:
+            print(
+                "[verl_omni_weight_sync] ServerAdapter.probe_weight_update_local_copy "
+                f"replica={self.replica_rank} rollout_rank={self.rollout_rank} "
+                f"target={target_name} event={event}",
+                flush=True,
+            )
+        return await self._execute_method(
+            "probe_weight_update_local_copy",
+            kwargs={"target_name": target_name, "event": event},
+        )
+
     @torch.no_grad()
     async def update_weights(
         self, weights: Generator[tuple[str, torch.Tensor], None, None], global_steps: int = None, **kwargs
     ):
         """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers."""
+        skip_weight_update = os.getenv("VERL_OMNI_SKIP_WEIGHT_UPDATE", "0").lower()
+        if os.getenv("VERL_OMNI_WEIGHT_SYNC_DEBUG", "0").lower() in {"1", "true", "yes"}:
+            print(
+                "[verl_omni_weight_sync] ServerAdapter.update_weights entry "
+                f"rollout={self.config.name} replica={self.replica_rank} "
+                f"rollout_rank={self.rollout_rank} global_steps={global_steps} "
+                f"skip={skip_weight_update} use_shm={self.use_shm}",
+                flush=True,
+            )
+        if self.replica_rank == 0 and self.rollout_rank == 0:
+            logger.warning(
+                "ServerAdapter.update_weights entry: config.name=%s, "
+                "VERL_OMNI_SKIP_WEIGHT_UPDATE=%s, global_steps=%s, use_shm=%s, module_file=%s, kwargs=%s",
+                self.config.name,
+                skip_weight_update,
+                global_steps,
+                self.use_shm,
+                __file__,
+                sorted(kwargs.keys()),
+            )
+        if (
+            self.config.name == "vllm_omni"
+            and skip_weight_update in {"1", "true", "yes"}
+        ):
+            if self.replica_rank == 0 and self.rollout_rank == 0:
+                logger.warning(
+                    "Skipping vLLM-Omni weight update before IPC due to VERL_OMNI_SKIP_WEIGHT_UPDATE; "
+                    "leaving rollout checkpoint weights untouched."
+                )
+            if global_steps is not None and self.rollout_rank == 0:
+                if self.server_handle is None:
+                    self.server_handle = ray.get_actor(f"vllm_server_{self.replica_rank}_{self.node_rank}")
+                await self.server_handle.set_global_steps.remote(global_steps)
+            return
+
         start_time = time.time()
 
         future = await self._execute_method(

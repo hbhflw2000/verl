@@ -154,8 +154,14 @@ class vLLMOmniHttpServer(vLLMHttpServer):
     # wake_up hook: Omni does not restore KV cache on wake-up
     # -----------------------------------------------------------------------
 
-    def _get_wake_up_tags(self) -> list[str]:
-        return ["weights"]
+    def _get_wake_up_tags(self) -> list[str] | None:
+        wake_tags_override = os.getenv("VERL_OMNI_WAKE_TAGS", "").strip()
+        if wake_tags_override:
+            normalized_wake_tags = wake_tags_override.lower()
+            if normalized_wake_tags in {"none", "null", "default"}:
+                return None
+            return [tag.strip() for tag in wake_tags_override.split(",") if tag.strip()]
+        return ["kv_cache", "weights"]
 
     async def generate(
         self,

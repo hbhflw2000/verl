@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import logging
+import os
 from abc import ABC, abstractmethod
 from typing import Any, Generator, TypedDict
 
@@ -26,6 +28,9 @@ from verl.utils.import_utils import import_external_libs
 from verl.utils.ray_utils import auto_await
 from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class TensorMeta(TypedDict):
@@ -412,9 +417,24 @@ class CheckpointEngineManager:
         Args:
             global_steps: The global steps of the trainer.
         """
+        if os.getenv("VERL_OMNI_WEIGHT_SYNC_DEBUG", "0").lower() in {"1", "true", "yes"}:
+            print(
+                "[verl_omni_weight_sync] CheckpointEngineManager.update_weights "
+                f"backend={self.backend} global_steps={global_steps} "
+                f"skip={os.getenv('VERL_OMNI_SKIP_WEIGHT_UPDATE', '0')}",
+                flush=True,
+            )
 
         # 0. update weights for sync training with colocated trainer and rollout
         if self.backend == "naive":
+            if os.getenv("VERL_OMNI_WEIGHT_SYNC_DEBUG", "0").lower() in {"1", "true", "yes"}:
+                logger.warning(
+                    "CheckpointEngineManager.update_weights naive path: global_steps=%s "
+                    "trainer_cls=%s VERL_OMNI_SKIP_WEIGHT_UPDATE=%s",
+                    global_steps,
+                    type(self.trainer).__name__,
+                    os.getenv("VERL_OMNI_SKIP_WEIGHT_UPDATE", "0"),
+                )
             ray.get(self.trainer.update_weights(global_steps=global_steps))
             return
 
