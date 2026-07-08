@@ -61,6 +61,7 @@ tracking metrics to diagnose and correct off-policy issues.
 """
 
 import math
+import os
 from typing import Any, Optional
 
 import torch
@@ -88,6 +89,112 @@ SUPPORTED_ROLLOUT_RS_OPTIONS: set[str] = {
     "seq_max_k3",
 }
 TOKEN_LEVEL_ROLLOUT_RS_OPTIONS: set[str] = {"token_k1", "token_k2", "token_k3"}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_float(name: str, default: Optional[float] = None) -> Optional[float]:
+    value = os.environ.get(name)
+    if value in (None, ""):
+        return default
+    return float(value)
+
+
+def _rollout_logprob_sanity(
+    old_log_prob: torch.Tensor,
+    rollout_log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> tuple[dict[str, float], torch.Tensor]:
+    """Diagnose rollout logprob pathologies without changing behavior by default."""
+    mask_bool = response_mask.bool()
+    valid_count = mask_bool.sum()
+    metrics: dict[str, float] = {
+        "sanity/valid_tokens": int(valid_count.item()),
+    }
+    if valid_count == 0:
+        keep_seq = torch.zeros(response_mask.shape[0], dtype=torch.bool, device=response_mask.device)
+        metrics.update(
+            {
+                "sanity/rollout_zero_fraction": float("nan"),
+                "sanity/rollout_nonfinite_fraction": float("nan"),
+                "sanity/old_nonfinite_fraction": float("nan"),
+                "sanity/pair_finite_fraction": float("nan"),
+                "sanity/bad_seq_fraction": float("nan"),
+            }
+        )
+        return metrics, keep_seq
+
+    rollout_values = torch.masked_select(rollout_log_prob.detach().float(), mask_bool)
+    old_values = torch.masked_select(old_log_prob.detach().float(), mask_bool)
+    rollout_finite = torch.isfinite(rollout_values)
+    old_finite = torch.isfinite(old_values)
+    pair_finite = rollout_finite & old_finite
+    rollout_zero = rollout_values == 0
+    rollout_near_zero = rollout_values.abs() < 1e-12
+    old_zero = old_values == 0
+
+    metrics.update(
+        {
+            "sanity/rollout_zero_fraction": rollout_zero.float().mean().detach().item(),
+            "sanity/rollout_near_zero_fraction": rollout_near_zero.float().mean().detach().item(),
+            "sanity/rollout_nonfinite_fraction": (~rollout_finite).float().mean().detach().item(),
+            "sanity/old_zero_fraction": old_zero.float().mean().detach().item(),
+            "sanity/old_nonfinite_fraction": (~old_finite).float().mean().detach().item(),
+            "sanity/pair_finite_fraction": pair_finite.float().mean().detach().item(),
+        }
+    )
+
+    seq_valid = mask_bool.sum(dim=-1)
+    seq_rollout_zero = ((rollout_log_prob == 0) & mask_bool).sum(dim=-1)
+    seq_rollout_nonfinite = ((~torch.isfinite(rollout_log_prob)) & mask_bool).sum(dim=-1)
+    seq_zero_fraction = seq_rollout_zero.float() / seq_valid.clamp(min=1).float()
+    seq_nonfinite_fraction = seq_rollout_nonfinite.float() / seq_valid.clamp(min=1).float()
+    zero_threshold = _env_float("VERL_OMNI_ROLLOUT_LOGPROB_ZERO_FRACTION_THRESHOLD", None)
+    if zero_threshold is None:
+        zero_threshold = _env_float("VERL_ROLLOUT_LOGPROB_ZERO_FRACTION_THRESHOLD", 0.05)
+    nonfinite_threshold = _env_float("VERL_OMNI_ROLLOUT_LOGPROB_NONFINITE_FRACTION_THRESHOLD", None)
+    if nonfinite_threshold is None:
+        nonfinite_threshold = _env_float("VERL_ROLLOUT_LOGPROB_NONFINITE_FRACTION_THRESHOLD", 0.0)
+
+    seq_has_tokens = seq_valid > 0
+    bad_seq = seq_has_tokens & (
+        (seq_zero_fraction > float(zero_threshold)) | (seq_nonfinite_fraction > float(nonfinite_threshold))
+    )
+    if seq_has_tokens.any():
+        metrics["sanity/seq_zero_fraction_max"] = seq_zero_fraction[seq_has_tokens].max().detach().item()
+        metrics["sanity/seq_zero_fraction_mean"] = seq_zero_fraction[seq_has_tokens].mean().detach().item()
+        metrics["sanity/seq_nonfinite_fraction_max"] = seq_nonfinite_fraction[seq_has_tokens].max().detach().item()
+        metrics["sanity/bad_seq_fraction"] = bad_seq[seq_has_tokens].float().mean().detach().item()
+    else:
+        metrics["sanity/seq_zero_fraction_max"] = float("nan")
+        metrics["sanity/seq_zero_fraction_mean"] = float("nan")
+        metrics["sanity/seq_nonfinite_fraction_max"] = float("nan")
+        metrics["sanity/bad_seq_fraction"] = float("nan")
+    metrics["sanity/zero_fraction_threshold"] = float(zero_threshold)
+    metrics["sanity/nonfinite_fraction_threshold"] = float(nonfinite_threshold)
+
+    if _env_flag("VERL_OMNI_ROLLOUT_LOGPROB_SANITY_HARD_FAIL") or _env_flag(
+        "VERL_ROLLOUT_LOGPROB_SANITY_HARD_FAIL"
+    ):
+        zero_bad = metrics["sanity/rollout_zero_fraction"] > float(zero_threshold)
+        nonfinite_bad = metrics["sanity/rollout_nonfinite_fraction"] > float(nonfinite_threshold)
+        if zero_bad or nonfinite_bad:
+            raise RuntimeError(
+                "Rollout logprob sanity check failed: "
+                f"zero_fraction={metrics['sanity/rollout_zero_fraction']:.6f} "
+                f"(threshold={zero_threshold}), "
+                f"nonfinite_fraction={metrics['sanity/rollout_nonfinite_fraction']:.6f} "
+                f"(threshold={nonfinite_threshold}), "
+                f"bad_seq_fraction={metrics['sanity/bad_seq_fraction']:.6f}. "
+                "This usually means rollout logprobs are missing, stale, or misaligned."
+            )
+
+    return metrics, ~bad_seq
 
 
 def _parse_rollout_is_threshold(threshold_spec: str | float) -> tuple[float, Optional[float]]:
@@ -838,9 +945,29 @@ def compute_rollout_correction_and_rejection_mask(
             f"log_prob shape {old_log_prob.shape} does not match response_mask shape {response_mask.shape}."
         )
 
+    metrics, sanity_keep_seq = _rollout_logprob_sanity(
+        old_log_prob=old_log_prob,
+        rollout_log_prob=rollout_log_prob,
+        response_mask=response_mask,
+    )
+    if _env_flag("VERL_OMNI_ROLLOUT_LOGPROB_SANITY_MASK_BAD_SEQS") or _env_flag(
+        "VERL_ROLLOUT_LOGPROB_SANITY_MASK_BAD_SEQS"
+    ):
+        sanity_seq_mask = sanity_keep_seq.unsqueeze(-1).to(dtype=response_mask.dtype)
+        response_mask = response_mask * sanity_seq_mask
+        metrics["sanity/masked_bad_seq_enabled"] = 1.0
+        metrics["sanity/masked_bad_seq_count"] = int((~sanity_keep_seq).sum().item())
+        if not response_mask.any():
+            raise RuntimeError(
+                "Rollout logprob sanity mask removed all valid tokens. "
+                "Disable VERL_OMNI_ROLLOUT_LOGPROB_SANITY_MASK_BAD_SEQS or inspect rollout logprobs."
+            )
+    else:
+        metrics["sanity/masked_bad_seq_enabled"] = 0.0
+        metrics["sanity/masked_bad_seq_count"] = 0
+
     # Step 1: Compute log ratio (log(π_train / π_rollout))
     log_ratio: torch.Tensor = old_log_prob - rollout_log_prob
-    metrics: dict[str, float] = {}
 
     # Step 2: Compute IS weights (if enabled)
     rollout_is_weights: Optional[torch.Tensor] = None

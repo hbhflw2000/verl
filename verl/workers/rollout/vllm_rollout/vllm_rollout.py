@@ -48,6 +48,15 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+def _topo_debug_enabled() -> bool:
+    return os.environ.get("VERL_OMNI_WEIGHT_SYNC_TOPO_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _topo_debug(message: str):
+    if _topo_debug_enabled():
+        print(f"[weight-sync-topo][server-adapter] {message}", flush=True)
+
+
 def _check_vllm_version_for_sleep_level():
     # https://github.com/vllm-project/vllm/issues/25171
     minver = "0.11.0"
@@ -106,6 +115,13 @@ class ServerAdapter(BaseRollout):
         local_rank = self.rollout_rank % local_world_size
         job_id = ray.get_runtime_context().get_job_id()
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
+        _topo_debug(
+            "init "
+            f"rank={rank} local_world_size={local_world_size} rollout_world_size={rollout_world_size} "
+            f"replica_rank={self.replica_rank} rollout_rank={self.rollout_rank} "
+            f"node_rank={self.node_rank} local_rank={local_rank} job_id={job_id} "
+            f"zmq_handle={self.zmq_handle}"
+        )
 
         self.use_shm = not is_support_ipc()
         if self.use_shm:
@@ -123,7 +139,12 @@ class ServerAdapter(BaseRollout):
         # Lazy init http server adapter because http server is launched after hybrid engine.
         if self.server_handle is None:
             prefix = self._get_server_name_prefix()
-            self.server_handle = ray.get_actor(f"{prefix}server_{self.replica_rank}_{self.node_rank}")
+            actor_name = f"{prefix}server_{self.replica_rank}_{self.node_rank}"
+            _topo_debug(
+                f"resolve server actor actor_name={actor_name} "
+                f"replica_rank={self.replica_rank} rollout_rank={self.rollout_rank} node_rank={self.node_rank}"
+            )
+            self.server_handle = ray.get_actor(actor_name)
         return True
 
     async def _execute_method(
@@ -172,11 +193,20 @@ class ServerAdapter(BaseRollout):
     ):
         """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers."""
         start_time = time.time()
+        _topo_debug(
+            "update_weights begin "
+            f"replica_rank={self.replica_rank} rollout_rank={self.rollout_rank} node_rank={self.node_rank} "
+            f"global_steps={global_steps} use_shm={self.use_shm} zmq_handle={self.zmq_handle}"
+        )
 
         future = await self._execute_method(
             "update_weights_from_ipc",
             non_block=True,
             kwargs={**kwargs, "use_shm": self.use_shm},
+        )
+        _topo_debug(
+            "update_weights receiver armed "
+            f"replica_rank={self.replica_rank} rollout_rank={self.rollout_rank} future_is_none={future is None}"
         )
 
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
@@ -185,19 +215,36 @@ class ServerAdapter(BaseRollout):
             bucket_size_mb=bucket_size_mb,
             use_shm=self.use_shm,
         )
+        _topo_debug(
+            f"update_weights sender begin replica_rank={self.replica_rank} rollout_rank={self.rollout_rank} "
+            f"bucket_mb={bucket_size_mb}"
+        )
         await sender.async_send_weights(weights)
+        _topo_debug(
+            f"update_weights sender done replica_rank={self.replica_rank} rollout_rank={self.rollout_rank}"
+        )
 
         if future is not None:
             await future
+            _topo_debug(
+                f"update_weights receiver future done replica_rank={self.replica_rank} rollout_rank={self.rollout_rank}"
+            )
 
         # reset prefix cache after updating weights
         if self.rollout_rank == 0:
             await self.server_handle.clear_kv_cache.remote()
             if global_steps is not None:
                 await self.server_handle.set_global_steps.remote(global_steps)
+            _topo_debug(
+                f"update_weights server post hooks done replica_rank={self.replica_rank} global_steps={global_steps}"
+            )
 
         if self.replica_rank == 0 and self.rollout_rank == 0:
             logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
+        _topo_debug(
+            "update_weights end "
+            f"replica_rank={self.replica_rank} rollout_rank={self.rollout_rank} elapsed={time.time() - start_time:.2f}s"
+        )
 
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix matching the rollout type (e.g. 'vllm_')."""

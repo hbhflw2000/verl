@@ -402,11 +402,26 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             except TrainingStopException:
                 print("[FullyAsyncTrainer] Training stopped by queue termination signal")
                 break
+            if (
+                os.environ.get("VERL_OMNI_STOP_AFTER_TOTAL_TRAINING_STEPS", "0").lower() in {"1", "true", "yes", "on"}
+                and self.current_param_version >= self.config.trainer.total_training_steps
+            ):
+                print(
+                    "[FullyAsyncTrainer] VERL_OMNI_STOP_AFTER_TOTAL_TRAINING_STEPS=1; "
+                    f"stop at current_param_version={self.current_param_version}"
+                )
+                break
 
         self.progress_bar.close()
         if self.current_param_version % self.config.trainer.test_freq != 0 or self.local_trigger_step > 1:
             await self._fit_update_weights()
             await self._fit_validate()
+        if self.metrics_aggregator.step_count > 0:
+            self.logger.log(
+                data=self.metrics_aggregator.get_aggregated_metrics(),
+                step=self.current_param_version,
+            )
+            self.metrics_aggregator.reset()
         self._fit_save_checkpoint(force=True)
 
     async def fit_step(self, batch_dict: dict = None):
@@ -500,6 +515,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
     async def _fit_update_weights(self):
         if self.local_trigger_step != 1:
+            return
+        if os.environ.get("VERL_OMNI_SKIP_WEIGHT_UPDATE", "0").lower() in {"1", "true", "yes", "on"}:
+            print(
+                "[FullyAsyncTrainer] VERL_OMNI_SKIP_WEIGHT_UPDATE=1; "
+                f"skip param sync at current_param_version={self.current_param_version}"
+            )
             return
 
         steps = self.config.global_profiler.steps

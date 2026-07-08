@@ -40,6 +40,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
+def _topo_debug_enabled() -> bool:
+    return os.environ.get("VERL_OMNI_WEIGHT_SYNC_TOPO_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _topo_debug(message: str):
+    if _topo_debug_enabled():
+        print(f"[weight-sync-topo][llm-server-manager] {message}", flush=True)
+
+
 @ray.remote
 class GlobalRequestLoadBalancer:
     """Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers.
@@ -300,6 +309,14 @@ class LLMServerManager:
             else self.rollout_config.n_gpus_per_node * self.rollout_config.nnodes
         )
         num_replicas = world_size // rollout_world_size
+        _topo_debug(
+            "initialize_llm_servers "
+            f"mode={'hybrid' if self.worker_group else 'standalone'} start_rank={start_rank} "
+            f"world_size={world_size} rollout_world_size={rollout_world_size} "
+            f"num_replicas={num_replicas} tp={self.rollout_config.tensor_model_parallel_size} "
+            f"dp={self.rollout_config.data_parallel_size} pp={self.rollout_config.pipeline_model_parallel_size} "
+            f"gpus_per_node={self.rollout_config.n_gpus_per_node} nnodes={self.rollout_config.nnodes}"
+        )
 
         self.rollout_replicas = [
             self.rollout_replica_class(
@@ -310,6 +327,11 @@ class LLMServerManager:
             )
             for replica_rank in range(num_replicas)
         ]
+        for idx, replica in enumerate(self.rollout_replicas):
+            _topo_debug(
+                f"created replica[{idx}] replica_rank={start_rank + idx} "
+                f"type={type(replica).__qualname__}"
+            )
 
         if self.worker_group and self.rollout_config.name != "trtllm":
             await asyncio.gather(*[server.init_hybrid(self.worker_group) for server in self.rollout_replicas])
@@ -327,6 +349,7 @@ class LLMServerManager:
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
         print(f"LLMServerManager: {self.server_addresses}")
+        _topo_debug(f"server_addresses={self.server_addresses}")
 
         # Update Prometheus configuration with server addresses
         if self.rollout_config.prometheus.enable:
