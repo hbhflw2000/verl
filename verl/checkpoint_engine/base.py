@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
@@ -28,6 +30,15 @@ from verl.utils.ray_utils import auto_await
 from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
 from verl.workers.rollout.utils import ensure_async_iterator
+
+
+def _topo_debug_enabled() -> bool:
+    return os.environ.get("VERL_OMNI_WEIGHT_SYNC_TOPO_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _topo_debug(message: str):
+    if _topo_debug_enabled():
+        print(f"[weight-sync-topo] {message}", flush=True)
 
 
 @dataclass
@@ -316,13 +327,20 @@ class CheckpointEngineWorker(Worker):
                 device_mesh=None,
                 **self.extra_rollout_kwargs,
             )
+        _topo_debug(
+            "CheckpointEngineWorker init "
+            f"backend={backend} bucket_mb={self.rollout_config.checkpoint_engine.update_weights_bucket_megabytes} "
+            f"server_adapter={type(self.server_adapter).__qualname__}"
+        )
         # sglang and trt-llm need device_mesh for internal communication
         initialize_global_process_group_ray(timeout_second=None, backend="cpu:gloo")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
+        _topo_debug(f"CheckpointEngineWorker.update_weights begin global_steps={global_steps}")
         weights = self.checkpoint_engine.receive_weights(global_steps=global_steps)
         await self.server_adapter.update_weights(weights, global_steps=global_steps)
+        _topo_debug(f"CheckpointEngineWorker.update_weights end global_steps={global_steps}")
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
@@ -387,12 +405,20 @@ class CheckpointEngineManager:
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for trainer and rollout replicas."""
         trainer = self.trainer
+        t0 = time.time()
+        _topo_debug(
+            "build_process_group prepare "
+            f"backend={self.backend} trainer_world={trainer.world_size} rollout_world={rollout.world_size} "
+            f"replicas={len(self.replicas)}"
+        )
 
         # 1. prepare all workers
         metadata = ray.get(
             trainer.execute_checkpoint_engine(["prepare"] * trainer.world_size)
             + rollout.execute_checkpoint_engine(["prepare"] * rollout.world_size)
         )
+        master_meta = metadata[0] if metadata else None
+        _topo_debug(f"build_process_group prepared metadata0={master_meta}")
 
         # 2. build communication topology between all workers
         trainer_kwargs, rollout_kwargs = self.backend_cls.build_topology(
@@ -405,11 +431,17 @@ class CheckpointEngineManager:
 
         trainer_kwargs["method"] = ["init_process_group"] * trainer.world_size
         rollout_kwargs["method"] = ["init_process_group"] * rollout.world_size
+        _topo_debug(
+            "build_process_group topology "
+            f"trainer_ranks={trainer_kwargs.get('rank')} rollout_ranks={rollout_kwargs.get('rank')} "
+            f"world={rollout_kwargs.get('world_size', ['?'])[0] if rollout_kwargs.get('world_size') else '?'}"
+        )
 
         # 3. init process group between all workers
         ray.get(
             trainer.execute_checkpoint_engine(**trainer_kwargs) + rollout.execute_checkpoint_engine(**rollout_kwargs)
         )
+        _topo_debug(f"build_process_group done elapsed={time.time() - t0:.2f}s")
 
     def add_replicas(self, replicas: list[RolloutReplica]):
         """Add rollout replicas to the manager for elastic scale up, will rebuild process group.
@@ -479,39 +511,58 @@ class CheckpointEngineManager:
             ray.get(self.trainer.update_weights(global_steps=global_steps, mode=self.backend))
             return
 
+        t0 = time.time()
+        _topo_debug(
+            "manager.update_weights begin "
+            f"global_steps={global_steps} backend={self.backend} replicas={len(self.replicas)} "
+            f"trainer_world={self.trainer.world_size}"
+        )
+
         # 1. abort and save all unfinished requests for partial rollout
         await self.abort_replicas()
+        _topo_debug("manager.update_weights abort_replicas done")
 
         # 2. create a temporay worker group for all replicas
         workers = []
-        for replica in self.replicas:
+        for replica_idx, replica in enumerate(self.replicas):
+            _topo_debug(
+                f"manager.update_weights replica[{replica_idx}] "
+                f"type={type(replica).__qualname__} workers={len(replica.workers)}"
+            )
             workers.extend(replica.workers)
         rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
         trainer = self.trainer
+        _topo_debug(f"manager.update_weights rollout worker group world={rollout.world_size}")
 
         # 3. release kv_cache before weight sync (weights stay in place)
         await self.release_kv_cache_replicas()
+        _topo_debug("manager.update_weights release_kv_cache_replicas done")
 
         # 4. build process group
         self.build_process_group(rollout)
 
         # 5. update weights of all workers
+        _topo_debug("manager.update_weights dispatch trainer+rollout update")
         ray.get(
             trainer.update_weights(global_steps=global_steps, mode=self.backend)
             + rollout.update_weights(global_steps=global_steps)
         )
+        _topo_debug("manager.update_weights trainer+rollout update done")
 
         # 6. finalize all workers
         ray.get(
             trainer.execute_checkpoint_engine(["finalize"] * trainer.world_size)
             + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
         )
+        _topo_debug("manager.update_weights finalize done")
 
         # 7. restore kv_cache after weight sync
         await self.resume_kv_cache_replicas()
+        _topo_debug("manager.update_weights resume_kv_cache_replicas done")
 
         # 8. resume all unfinished requests for partial rollout
         await self.resume_generation_replicas()
+        _topo_debug(f"manager.update_weights end elapsed={time.time() - t0:.2f}s")
 
 
 async def split_weight_chunks(

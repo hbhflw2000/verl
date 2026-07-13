@@ -81,6 +81,15 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+def _topo_debug_enabled() -> bool:
+    return os.environ.get("VERL_OMNI_WEIGHT_SYNC_TOPO_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _topo_debug(message: str):
+    if _topo_debug_enabled():
+        print(f"[weight-sync-topo][vllm-server] {message}", flush=True)
+
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -120,6 +129,12 @@ class vLLMHttpServer:
         # with EADDRINUSE; a stale socket from a crashed run trips the same
         # error on restart.
         os.environ["VERL_RAY_JOB_ID"] = ray.get_runtime_context().get_job_id()
+        _topo_debug(
+            "init "
+            f"replica_rank={replica_rank} node_rank={node_rank} gpus_per_node={gpus_per_node} nnodes={nnodes} "
+            f"cuda_visible_devices={cuda_visible_devices} ray_job_id={os.environ['VERL_RAY_JOB_ID']} "
+            f"workers={len(workers)}"
+        )
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
@@ -169,6 +184,12 @@ class vLLMHttpServer:
             self._dp_master_port = None
 
         self._post_init(cuda_visible_devices)
+        _topo_debug(
+            "post_init "
+            f"replica_rank={self.replica_rank} node_rank={self.node_rank} "
+            f"server_address={self._server_address} master_port={self._master_port} "
+            f"dp_rpc_port={self._dp_rpc_port} dp_master_port={self._dp_master_port}"
+        )
 
     def get_master_address(self):
         """Get master address and port for data parallel.
@@ -210,6 +231,12 @@ class vLLMHttpServer:
             self._master_address = master_address
             self._master_port = master_port
             self._dp_rpc_port = dp_rpc_port
+        _topo_debug(
+            "launch_server begin "
+            f"replica_rank={self.replica_rank} node_rank={self.node_rank} "
+            f"master={self._master_address}:{self._master_port} dp_rpc={self._dp_rpc_port} "
+            f"mode={self.rollout_mode}"
+        )
 
         # 1. setup vllm serve cli args
         engine_kwargs = self.config.get("engine_kwargs", {}).get(self._get_engine_kwargs_key(), {}) or {}
@@ -381,6 +408,10 @@ class vLLMHttpServer:
             await self.run_server(server_args)
         else:
             await self.run_headless(server_args)
+        _topo_debug(
+            "launch_server end "
+            f"replica_rank={self.replica_rank} node_rank={self.node_rank} server_port={self._server_port}"
+        )
 
     async def run_server(self, args: argparse.Namespace):
         engine_args = AsyncEngineArgs.from_cli_args(args)
@@ -429,6 +460,11 @@ class vLLMHttpServer:
 
         self.engine = engine_client
         self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
+        _topo_debug(
+            "run_server ready "
+            f"replica_rank={self.replica_rank} node_rank={self.node_rank} "
+            f"server={self._server_address}:{self._server_port}"
+        )
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""

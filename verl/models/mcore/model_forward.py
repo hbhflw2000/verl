@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import Optional
 
 import torch
@@ -261,6 +262,31 @@ def _build_mtp_loss_mask_nested(response_mask, input_ids_lengths, response_atten
     return torch.nested.nested_tensor(pieces, layout=torch.jagged)
 
 
+def _model_builds_own_mrope_position_ids(model) -> bool:
+    unwrapped_model = unwrap_model(model)
+    model_cls = unwrapped_model.__class__
+    return model_cls.__name__ == "Qwen3OmniModel" and "qwen_omni" in model_cls.__module__
+
+
+_QWEN3_OMNI_BSHD_POSITION_IDS_ENV = "VERL_OMNI_QWEN3_OMNI_BSHD_POSITION_IDS"
+
+
+def _select_bshd_position_ids_for_engine(model, vision_model: bool, position_ids_bshd):
+    if vision_model:
+        return None
+    if _model_builds_own_mrope_position_ids(model):
+        mode = os.getenv(_QWEN3_OMNI_BSHD_POSITION_IDS_ENV, "model").strip().lower()
+        if mode in {"model", "auto", "none", "0", "false", "no"}:
+            return None
+        if mode in {"explicit", "precomputed", "pass", "1", "true", "yes"}:
+            return position_ids_bshd
+        raise ValueError(
+            f"{_QWEN3_OMNI_BSHD_POSITION_IDS_ENV} must be one of "
+            "'model'/'auto'/'none' or 'explicit'/'precomputed'/'pass', got {mode!r}"
+        )
+    return position_ids_bshd
+
+
 def gptmodel_forward_model_engine(
     model,
     input_ids,
@@ -421,7 +447,7 @@ def gptmodel_forward_model_engine(
         output_orig = model(
             input_ids=input_ids_bshd,
             attention_mask=attention_mask,
-            position_ids=None if vision_model else position_ids_bshd,
+            position_ids=_select_bshd_position_ids_for_engine(model, vision_model, position_ids_bshd),
             **model_kwargs,
         )
         if post_process and logits_processor is not None:

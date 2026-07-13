@@ -40,6 +40,15 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _topo_debug_enabled() -> bool:
+    return os.environ.get("VERL_OMNI_WEIGHT_SYNC_TOPO_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _topo_debug(message: str):
+    if _topo_debug_enabled():
+        print(f"[weight-sync-topo][nccl] {message}", flush=True)
+
+
 @dataclass
 class MasterMetadata:
     zmq_ip: str
@@ -130,6 +139,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
         self.topic = "bucket_metadata"
         if self.is_master:
             self._start_zmq_server()
+        _topo_debug(
+            "engine init "
+            f"is_master={self.is_master} group={self.group_name} rebuild={self.rebuild_group} "
+            f"bucket_mb={self.bucket_size / (1024 * 1024):.1f}"
+        )
 
     def prepare(self) -> MasterMetadata:
         # For master process, use cupy instead of torch to avoid memory register error
@@ -141,10 +155,16 @@ class NCCLCheckpointEngine(CheckpointEngine):
             self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="cuda")
             self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="cuda")
 
-        return MasterMetadata(zmq_ip=self.ip, zmq_port=self.listen_port) if self.is_master else None
+        metadata = MasterMetadata(zmq_ip=self.ip, zmq_port=self.listen_port) if self.is_master else None
+        _topo_debug(f"prepare is_master={self.is_master} metadata={metadata}")
+        return metadata
 
     def finalize(self):
         """Destroy the NCCL process group if rebuild_group is True."""
+        _topo_debug(
+            f"finalize rank={getattr(self, 'rank', None)} world_size={getattr(self, 'world_size', None)} "
+            f"rebuild={self.rebuild_group}"
+        )
         if self.rebuild_group:
             if self.rank >= 0:
                 collective.destroy_collective_group(self.group_name)
@@ -168,6 +188,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
             "world_size": [rollout_world_size + 1] * rollout_world_size,
             "master_metadata": [metadata[0]] * rollout_world_size,
         }
+        _topo_debug(
+            "build_topology "
+            f"trainer_world={trainer_world_size} rollout_world={rollout_world_size} "
+            f"total_world={rollout_world_size + 1} master={metadata[0] if metadata else None}"
+        )
         return trainer_kwargs, rollout_kwargs
 
     def _start_zmq_server(self):
@@ -183,6 +208,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
             address = f"tcp://{self.ip}:{self.listen_port}"
 
         self.socket.bind(address)
+        _topo_debug(f"master zmq bind address={address}")
 
     def _connect_zmq_client(self, metadata: MasterMetadata):
         assert not self.is_master, "Master process should not connect to other processes."
@@ -196,6 +222,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         self.socket.connect(address)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, self.topic)
+        _topo_debug(f"rank={getattr(self, 'rank', None)} zmq connect address={address}")
 
     def init_process_group(self, rank: int, world_size: int, master_metadata: MasterMetadata):
         """Initialize the NCCL process group.
@@ -208,8 +235,13 @@ class NCCLCheckpointEngine(CheckpointEngine):
         if rank < 0:
             self.rank = rank
             self.world_size = world_size
+            _topo_debug(f"init_process_group skip trainer rank={rank} world_size={world_size}")
             return
 
+        _topo_debug(
+            "init_process_group begin "
+            f"rank={rank} world_size={world_size} group={self.group_name} master={master_metadata}"
+        )
         if self.rebuild_group or not collective.is_group_initialized(self.group_name):
             collective.init_collective_group(world_size, rank, "nccl", self.group_name)
             self.rank = rank
@@ -225,6 +257,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
         collective.barrier(self.group_name)
 
         logger.info(f"init_process_group rank: {self.rank}, world_size: {self.world_size}")
+        _topo_debug(f"init_process_group done rank={self.rank} world_size={self.world_size}")
 
     @torch.no_grad()
     async def send_weights(
@@ -241,8 +274,10 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         # For trainer rank other than 0, consume weights without sending.
         if self.rank < 0:
+            consumed = 0
             for name, weight in weights:
-                pass
+                consumed += 1
+            _topo_debug(f"send_weights skipped non-master trainer consumed_params={consumed}")
             return
 
         send_buf, recv_buf = self.send_buf, self.recv_buf
@@ -251,6 +286,10 @@ class NCCLCheckpointEngine(CheckpointEngine):
         start_time = time.time()
         bucket_meta: dict[str, TensorMeta] = {}
         offset = 0
+        bucket_idx = 0
+        total_params = 0
+        total_bytes = 0
+        _topo_debug(f"send_weights begin rank={self.rank} world_size={self.world_size} global_steps={global_steps}")
         async for tensor_meta, chunk in split_weight_chunks(weights, self.bucket_size):
             # fill the tensor bucket
             if offset + tensor_meta.chunk_size > self.bucket_size:
@@ -268,6 +307,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
                     socket=self.socket,
                     topic=self.topic,
                 )
+                bucket_idx += 1
+                _topo_debug(
+                    f"send_weights bucket={bucket_idx} params={len(bucket_meta)} "
+                    f"bytes={sum(meta.chunk_size for meta in bucket_meta.values())} is_last=False"
+                )
 
                 # swap send_buf and recv_buf
                 send_buf, recv_buf = recv_buf, send_buf
@@ -281,6 +325,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
             bucket_meta[tensor_meta.name] = tensor_meta
             send_buf[offset : offset + tensor_meta.chunk_size] = cp.asarray(chunk)
             offset += tensor_meta.chunk_size
+            total_params += 1
+            total_bytes += tensor_meta.chunk_size
 
         # broadcast last bucket
         torch.cuda.synchronize()
@@ -296,6 +342,15 @@ class NCCLCheckpointEngine(CheckpointEngine):
             topic=self.topic,
         )
         await broadcast_op.wait_for_complete()
+        bucket_idx += 1
+        _topo_debug(
+            f"send_weights bucket={bucket_idx} params={len(bucket_meta)} "
+            f"bytes={sum(meta.chunk_size for meta in bucket_meta.values())} is_last=True"
+        )
+        _topo_debug(
+            f"send_weights end buckets={bucket_idx} chunks={total_params} bytes={total_bytes} "
+            f"elapsed={time.time() - start_time:.2f}s"
+        )
         logger.info(f"Rank {self.rank} send weights done, time cost: {time.time() - start_time:.2f}s")
 
     @torch.no_grad()
@@ -323,6 +378,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         # receive first bucket
         start_time = time.time()
+        bucket_idx = 0
+        _topo_debug(f"receive_weights begin rank={self.rank} world_size={self.world_size} global_steps=None")
         broadcast_op = BroadcastOperation(
             rank=self.rank,
             group_name=self.group_name,
@@ -334,6 +391,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
         metadata = await broadcast_op.wait_for_complete()
         total_bytes += self.bucket_size
         total_params += len(metadata["bucket_meta"])
+        bucket_idx += 1
+        _topo_debug(
+            f"receive_weights bucket={bucket_idx} rank={self.rank} params={len(metadata['bucket_meta'])} "
+            f"is_last={metadata['is_last']}"
+        )
 
         # swap send_buf and recv_buf
         send_buf, recv_buf = recv_buf, send_buf
@@ -357,6 +419,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
             metadata = await broadcast_op.wait_for_complete()
             total_bytes += self.bucket_size
             total_params += len(metadata["bucket_meta"])
+            bucket_idx += 1
+            _topo_debug(
+                f"receive_weights bucket={bucket_idx} rank={self.rank} params={len(metadata['bucket_meta'])} "
+                f"is_last={metadata['is_last']}"
+            )
 
             # 4. swap send_buf and recv_buf
             torch.cuda.synchronize()  # sync non-blocking copy
@@ -372,4 +439,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
         logger.info(
             f"Rank {self.rank} receive weights done, total_params: {total_params}, "
             f"time cost: {time_cost:.2f}s, bandwidth: {bandwidth:.2f} GB/s"
+        )
+        _topo_debug(
+            f"receive_weights end rank={self.rank} buckets={bucket_idx} params={total_params} "
+            f"elapsed={time_cost:.2f}s bandwidth={bandwidth:.2f}GB/s"
         )

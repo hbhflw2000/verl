@@ -43,6 +43,64 @@ class TestMetrics(unittest.TestCase):
         print(metrics)
         assert metrics["training/rollout_probs_diff_valid"] == 1
 
+    def test_calculate_debug_metrics_reports_shift_alignment(self):
+        rollout_log_probs = torch.tensor([[-9.0, -1.0, -2.0, -3.0]])
+        old_log_probs = torch.tensor([[-1.0, -2.0, -3.0, -8.0]])
+        data = DataProto.from_dict(
+            {
+                "rollout_log_probs": rollout_log_probs,
+                "old_log_probs": old_log_probs,
+                "response_mask": torch.ones_like(rollout_log_probs, dtype=torch.long),
+                "responses": torch.zeros((1, 4), dtype=torch.long),
+            }
+        )
+
+        metrics = calculate_debug_metrics(data)
+
+        assert metrics["training/rollout_shift/old_t_rollout_t_plus_1/valid_tokens"] == 3
+        assert metrics["training/rollout_shift/old_t_rollout_t_plus_1/logprob_abs_diff_mean"] == 0
+        assert metrics["training/rollout_shift/old_t_plus_1_rollout_t/logprob_abs_diff_mean"] > 0
+
+    def test_calculate_debug_metrics_reports_rollout_logprob_pathologies(self):
+        rollout_log_probs = torch.tensor([[0.0, -1.0, float("inf"), -3.0]])
+        old_log_probs = torch.tensor([[-0.5, -1.0, -2.0, -3.5]])
+        data = DataProto.from_dict(
+            {
+                "rollout_log_probs": rollout_log_probs,
+                "old_log_probs": old_log_probs,
+                "response_mask": torch.ones_like(rollout_log_probs, dtype=torch.long),
+                "responses": torch.zeros((1, 4), dtype=torch.long),
+            }
+        )
+
+        metrics = calculate_debug_metrics(data)
+
+        assert metrics["training/rollout_log_probs/valid_tokens"] == 4
+        assert metrics["training/rollout_log_probs/zero_fraction"] == 0.25
+        assert metrics["training/rollout_log_probs/nonfinite_fraction"] == 0.25
+        assert metrics["training/actor_old_log_probs/nonfinite_fraction"] == 0
+        assert "training/rollout_actor_logprob_pearson_corr" in metrics
+
+    def test_calculate_debug_metrics_reports_ref_alignment(self):
+        rollout_log_probs = torch.tensor([[-0.1, -0.2, -0.3, -0.4]])
+        old_log_probs = torch.tensor([[-3.1, -3.2, -3.3, -3.4]])
+        ref_log_prob = old_log_probs.clone()
+        data = DataProto.from_dict(
+            {
+                "rollout_log_probs": rollout_log_probs,
+                "old_log_probs": old_log_probs,
+                "ref_log_prob": ref_log_prob,
+                "response_mask": torch.ones_like(rollout_log_probs, dtype=torch.long),
+                "responses": torch.zeros((1, 4), dtype=torch.long),
+            }
+        )
+
+        metrics = calculate_debug_metrics(data)
+
+        assert metrics["training/ref_log_prob/valid_tokens"] == 4
+        assert metrics["training/actor_ref_logprob_abs_diff_mean"] == 0
+        assert metrics["training/rollout_ref_logprob_abs_diff_mean"] > 0
+
 
 if __name__ == "__main__":
     unittest.main()

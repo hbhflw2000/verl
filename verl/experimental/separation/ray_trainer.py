@@ -553,6 +553,10 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                 ref_log_prob = self._compute_ref_log_prob(batch)
                 batch = batch.union(ref_log_prob)
+            if "rollout_log_probs" in batch.batch and "old_log_probs" in batch.batch:
+                from verl.utils.debug.metrics import calculate_debug_metrics
+
+                self.metrics.update(calculate_debug_metrics(batch))
         return batch
 
     def _fit_compute_critic(self, batch: DataProto) -> DataProto:
