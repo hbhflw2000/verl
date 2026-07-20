@@ -28,10 +28,15 @@ and is designed to be fully replaceable by other agent frameworks such as:
 """
 
 import asyncio
+import fcntl
+import json
 import logging
 import os
 import random
+import socket
+import time
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -74,6 +79,27 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+
+
+def _append_multistage_logprob_debug_jsonl(event: str, payload: dict[str, Any]) -> None:
+    output_path = os.environ.get("VERL_OMNI_MULTISTAGE_LOGPROB_DEBUG_JSONL", "")
+    if not output_path:
+        return
+    try:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "event": event,
+            "time": time.time(),
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            **payload,
+        }
+        with open(output_path, "a", encoding="utf-8") as fout:
+            fcntl.flock(fout.fileno(), fcntl.LOCK_EX)
+            fout.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            fcntl.flock(fout.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        logger.exception("Failed to append multi-stage logprob debug jsonl")
 
 
 class AgentLoopMetrics(BaseModel):
@@ -622,6 +648,111 @@ class AgentLoopWorker:
                 padded["attention_mask"] = padded["attention_mask"].unsqueeze(0)
         return padded
 
+    def _maybe_log_postprocess_debug(
+        self,
+        output: AgentLoopOutput,
+        response_logprobs: Optional[torch.Tensor],
+        **kwargs,
+    ) -> None:
+        raw_limit = os.environ.get("VERL_OMNI_AGENT_LOOP_DEBUG_LIMIT", "0")
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            limit = 0
+        if limit <= 0:
+            return
+
+        emitted = getattr(self, "_agent_loop_debug_emitted", 0)
+        if emitted >= limit:
+            return
+        self._agent_loop_debug_emitted = emitted + 1
+
+        token_limit = min(16, limit)
+        response_logprob_head = None
+        if response_logprobs is not None:
+            response_logprob_head = response_logprobs[0, :token_limit].detach().float().cpu().tolist()
+        response_mask_head = output.response_mask[:token_limit]
+        response_token_head = output.response_ids[:token_limit]
+        prompt_tail = output.prompt_ids[-token_limit:]
+        sample_index = kwargs.get("index", None)
+        if hasattr(sample_index, "item"):
+            sample_index = sample_index.item()
+
+        print(
+            "[AgentLoopPostprocessDebug] "
+            f"emitted={self._agent_loop_debug_emitted}/{limit} "
+            f"sample_index={sample_index} "
+            f"prompt_len={len(output.prompt_ids)} response_len={len(output.response_ids)} "
+            f"response_logprobs_len={0 if output.response_logprobs is None else len(output.response_logprobs)} "
+            f"prompt_tail={prompt_tail} "
+            f"response_head={response_token_head} "
+            f"response_mask_head={response_mask_head} "
+            f"response_logprobs_head={response_logprob_head}"
+        )
+        _append_multistage_logprob_debug_jsonl(
+            "agent_loop_postprocess",
+            {
+                "sample_index": sample_index,
+                "prompt_len": len(output.prompt_ids),
+                "response_len": len(output.response_ids),
+                "response_logprobs_len": 0 if output.response_logprobs is None else len(output.response_logprobs),
+                "prompt_tail": prompt_tail,
+                "response_head": response_token_head,
+                "response_mask_head": response_mask_head,
+                "response_logprobs_head": response_logprob_head,
+                "global_steps": output.extra_fields.get("global_steps"),
+                "raw_prompt_present": "raw_prompt" in kwargs,
+            },
+        )
+
+    @staticmethod
+    def _tensor_head(tensor: torch.Tensor | None, row_idx: int, limit: int) -> list:
+        if tensor is None or tensor.dim() < 2 or row_idx >= tensor.shape[0]:
+            return []
+        return tensor[row_idx, : min(limit, tensor.shape[-1])].detach().cpu().tolist()
+
+    def _maybe_log_postprocess_batch_debug(self, output: DataProto) -> None:
+        output_path = os.environ.get("VERL_OMNI_MULTISTAGE_LOGPROB_DEBUG_JSONL", "")
+        if not output_path or "responses" not in output.batch:
+            return
+        try:
+            row_limit = int(os.environ.get("VERL_OMNI_MULTISTAGE_LOGPROB_DEBUG_ROWS", "4"))
+        except ValueError:
+            row_limit = 4
+        try:
+            token_limit = int(os.environ.get("VERL_OMNI_MULTISTAGE_LOGPROB_DEBUG_TOKENS", "16"))
+        except ValueError:
+            token_limit = 16
+        if row_limit <= 0 or token_limit <= 0:
+            return
+
+        rows = []
+        responses = output.batch.get("responses")
+        response_mask = output.batch.get("response_mask")
+        rollout_log_probs = output.batch.get("rollout_log_probs")
+        for row_idx in range(min(row_limit, responses.shape[0])):
+            row_payload = {
+                "row": row_idx,
+                "response_head": self._tensor_head(responses, row_idx, token_limit),
+                "response_mask_head": self._tensor_head(response_mask, row_idx, token_limit),
+                "rollout_log_probs_head": self._tensor_head(rollout_log_probs, row_idx, token_limit),
+            }
+            for key in ("index", "_rollout_seed_global_idx", "agent_name"):
+                value = output.non_tensor_batch.get(key)
+                if value is not None and row_idx < len(value):
+                    item = value[row_idx]
+                    row_payload[key] = item.item() if hasattr(item, "item") else item
+            rows.append(row_payload)
+
+        _append_multistage_logprob_debug_jsonl(
+            "agent_loop_batch_postprocess",
+            {
+                "batch_size": len(output),
+                "shapes": {key: list(value.shape) for key, value in output.batch.items()},
+                "rows": rows,
+            },
+        )
+
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
@@ -672,6 +803,7 @@ class AgentLoopWorker:
         if output.response_logprobs is not None:
             pad_size = self.rollout_config.response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
+        self._maybe_log_postprocess_debug(output, response_logprobs, **kwargs)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
@@ -1012,11 +1144,13 @@ class AgentLoopWorker:
         else:
             meta_info = {"metrics": metrics}
 
-        return DataProto(
+        output = DataProto(
             batch=batch,
             non_tensor_batch=non_tensor_batch,
             meta_info=meta_info,
         )
+        self._maybe_log_postprocess_batch_debug(output)
+        return output
 
 
 async def get_trajectory_info(step, index, validate):

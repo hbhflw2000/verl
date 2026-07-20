@@ -412,6 +412,74 @@ def test_bool_rollout_is_threshold_is_rejected():
         )
 
 
+def test_rollout_logprob_sanity_metrics_default_observe_only():
+    """Zero rollout logprobs should be diagnosed without changing masks by default."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    old_log_prob = torch.tensor([[-1.0, -2.0, -3.0]], device=device)
+    rollout_log_prob = torch.tensor([[0.0, -2.0, -3.0]], device=device)
+    response_mask = torch.ones_like(old_log_prob)
+
+    weights_proto, modified_response_mask, metrics = compute_rollout_correction_and_rejection_mask(
+        old_log_prob=old_log_prob,
+        rollout_log_prob=rollout_log_prob,
+        response_mask=response_mask,
+        rollout_is=None,
+        rollout_rs=None,
+    )
+
+    assert weights_proto is None
+    assert torch.equal(modified_response_mask, response_mask)
+    assert metrics["rollout_corr/sanity/rollout_zero_fraction"] == pytest.approx(1.0 / 3.0)
+    assert metrics["rollout_corr/sanity/bad_seq_fraction"] == pytest.approx(1.0)
+    assert metrics["rollout_corr/sanity/masked_bad_seq_enabled"] == 0.0
+
+
+def test_rollout_logprob_sanity_hard_fail(monkeypatch):
+    """Hard fail mode catches missing rollout logprobs before producing misleading KL/corr."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    monkeypatch.setenv("VERL_OMNI_ROLLOUT_LOGPROB_SANITY_HARD_FAIL", "1")
+    monkeypatch.setenv("VERL_OMNI_ROLLOUT_LOGPROB_ZERO_FRACTION_THRESHOLD", "0.0")
+
+    old_log_prob = torch.tensor([[-1.0, -2.0]], device=device)
+    rollout_log_prob = torch.tensor([[0.0, -2.0]], device=device)
+    response_mask = torch.ones_like(old_log_prob)
+
+    with pytest.raises(RuntimeError, match="Rollout logprob sanity check failed"):
+        compute_rollout_correction_and_rejection_mask(
+            old_log_prob=old_log_prob,
+            rollout_log_prob=rollout_log_prob,
+            response_mask=response_mask,
+            rollout_is=None,
+            rollout_rs=None,
+        )
+
+
+def test_rollout_logprob_sanity_can_mask_bad_sequences(monkeypatch):
+    """Optional mask mode drops only sequences with pathological rollout logprobs."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    monkeypatch.setenv("VERL_OMNI_ROLLOUT_LOGPROB_SANITY_MASK_BAD_SEQS", "1")
+    monkeypatch.setenv("VERL_OMNI_ROLLOUT_LOGPROB_ZERO_FRACTION_THRESHOLD", "0.5")
+
+    old_log_prob = torch.tensor([[-1.0, -2.0], [-1.5, -2.5]], device=device)
+    rollout_log_prob = torch.tensor([[0.0, 0.0], [-1.5, -2.5]], device=device)
+    response_mask = torch.ones_like(old_log_prob)
+
+    _, modified_response_mask, metrics = compute_rollout_correction_and_rejection_mask(
+        old_log_prob=old_log_prob,
+        rollout_log_prob=rollout_log_prob,
+        response_mask=response_mask,
+        rollout_is=None,
+        rollout_rs=None,
+    )
+
+    expected_mask = torch.tensor([[0.0, 0.0], [1.0, 1.0]], device=device)
+    torch.testing.assert_close(modified_response_mask, expected_mask)
+    assert metrics["rollout_corr/sanity/masked_bad_seq_enabled"] == 1.0
+    assert metrics["rollout_corr/sanity/masked_bad_seq_count"] == 1
+    assert metrics["rollout_corr/sanity/bad_seq_fraction"] == pytest.approx(0.5)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Rollout Correction Test Suite")

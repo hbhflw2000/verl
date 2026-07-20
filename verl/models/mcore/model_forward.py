@@ -13,6 +13,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+import os
 from typing import Optional
 
 import torch
@@ -261,6 +263,125 @@ def _build_mtp_loss_mask_nested(response_mask, input_ids_lengths, response_atten
     return torch.nested.nested_tensor(pieces, layout=torch.jagged)
 
 
+def _model_builds_own_mrope_position_ids(model) -> bool:
+    unwrapped_model = unwrap_model(model)
+    model_cls = unwrapped_model.__class__
+    return model_cls.__name__ == "Qwen3OmniModel" and "qwen_omni" in model_cls.__module__
+
+
+_QWEN3_OMNI_BSHD_POSITION_IDS_ENV = "VERL_OMNI_QWEN3_OMNI_BSHD_POSITION_IDS"
+_MEGATRON_BSHD_DEBUG_JSONL_ENV = "VERL_OMNI_MEGATRON_BSHD_DEBUG_JSONL"
+_MEGATRON_BSHD_DEBUG_COUNTS = {}
+
+
+def _debug_dist_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return int(os.getenv("RANK", "0"))
+
+
+def _debug_shape(value):
+    if value is None:
+        return None
+    try:
+        return _debug_jsonable(list(value.shape))
+    except Exception:
+        return None
+
+
+def _debug_jsonable(value):
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _debug_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_debug_jsonable(v) for v in value]
+    try:
+        return int(value)
+    except Exception:
+        try:
+            return float(value)
+        except Exception:
+            return str(value)
+
+
+def _debug_tensor_slice(value, rows: int, tokens: int, tail: bool = False):
+    if value is None:
+        return None
+    try:
+        if isinstance(value, NestedTensor) or getattr(value, "is_nested", False):
+            values = value.values()
+            offsets = value.offsets()
+            values_slice = values[-tokens:] if tail else values[:tokens]
+            return {
+                "nested": True,
+                "values_shape": _debug_shape(values),
+                "offsets": offsets[: rows + 1].detach().cpu().tolist(),
+                "values": _debug_jsonable(values_slice.detach().cpu().tolist()),
+            }
+        tensor = value.detach()
+        if tensor.dim() == 0:
+            return _debug_jsonable(tensor.cpu().item())
+        if tensor.dim() == 1:
+            tensor_slice = tensor[-tokens:] if tail else tensor[:tokens]
+            return _debug_jsonable(tensor_slice.cpu().tolist())
+        tensor_slice = tensor[:rows, -tokens:] if tail else tensor[:rows, :tokens]
+        return _debug_jsonable(tensor_slice.cpu().tolist())
+    except Exception as exc:
+        return {"error": repr(exc), "shape": _debug_shape(value)}
+
+
+def _write_megatron_bshd_debug(event: str, **payload):
+    base_path = os.getenv(_MEGATRON_BSHD_DEBUG_JSONL_ENV, "").strip()
+    if not base_path:
+        return
+    limit = int(os.getenv("VERL_OMNI_MEGATRON_BSHD_DEBUG_LIMIT", "2"))
+    rank = _debug_dist_rank()
+    key = (rank, event)
+    count = _MEGATRON_BSHD_DEBUG_COUNTS.get(key, 0)
+    if count >= limit:
+        return
+    _MEGATRON_BSHD_DEBUG_COUNTS[key] = count + 1
+
+    rows = int(os.getenv("VERL_OMNI_MEGATRON_BSHD_DEBUG_ROWS", "2"))
+    tokens = int(os.getenv("VERL_OMNI_MEGATRON_BSHD_DEBUG_TOKENS", "16"))
+    record = {
+        "event": event,
+        "rank": rank,
+        "local_rank": os.getenv("LOCAL_RANK"),
+        "count": count,
+    }
+    for name, value in payload.items():
+        record[name] = {
+            "shape": _debug_shape(value),
+            "head": _debug_tensor_slice(value, rows=rows, tokens=tokens),
+            "tail": _debug_tensor_slice(value, rows=rows, tokens=tokens, tail=True),
+        }
+
+    path = f"{base_path}.rank{rank}.jsonl"
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(_debug_jsonable(record), ensure_ascii=True) + "\n")
+    except Exception as exc:
+        print(f"[MegatronBSHDDebug] failed to write {event} debug record: {exc}", flush=True)
+
+
+def _select_bshd_position_ids_for_engine(model, vision_model: bool, position_ids_bshd):
+    if vision_model:
+        return None
+    if _model_builds_own_mrope_position_ids(model):
+        mode = os.getenv(_QWEN3_OMNI_BSHD_POSITION_IDS_ENV, "model").strip().lower()
+        if mode in {"model", "auto", "none", "0", "false", "no"}:
+            return None
+        if mode in {"explicit", "precomputed", "pass", "1", "true", "yes"}:
+            return position_ids_bshd
+        raise ValueError(
+            f"{_QWEN3_OMNI_BSHD_POSITION_IDS_ENV} must be one of "
+            "'model'/'auto'/'none' or 'explicit'/'precomputed'/'pass', got {mode!r}"
+        )
+    return position_ids_bshd
+
+
 def gptmodel_forward_model_engine(
     model,
     input_ids,
@@ -421,21 +542,50 @@ def gptmodel_forward_model_engine(
         output_orig = model(
             input_ids=input_ids_bshd,
             attention_mask=attention_mask,
-            position_ids=None if vision_model else position_ids_bshd,
+            position_ids=_select_bshd_position_ids_for_engine(model, vision_model, position_ids_bshd),
             **model_kwargs,
         )
         if post_process and logits_processor is not None:
-            args = {
-                k: preprocess_bshd_engine(
-                    v, pre_process=True, need_roll=(k == "label"), use_fp8_padding=use_fp8_padding
-                )[0]
-                for k, v in logits_processor_args.items()
-            }
+            args = {}
+            for key, value in logits_processor_args.items():
+                if key == "audit_input_ids":
+                    # Already in BSHD's unpadded order; processing it again
+                    # would change the sequence identifier used by the audit.
+                    args[key] = input_ids_bshd
+                elif key == "audit_attention_mask":
+                    args[key] = attention_mask_bshd
+                elif key == "audit_response_lengths":
+                    args[key] = value
+                else:
+                    args[key] = preprocess_bshd_engine(
+                        value, pre_process=True, need_roll=(key == "label"), use_fp8_padding=use_fp8_padding
+                    )[0]
+            _write_megatron_bshd_debug(
+                "before_logits_processor",
+                input_ids_bshd=input_ids_bshd,
+                attention_mask_bshd=attention_mask_bshd,
+                position_ids_bshd=position_ids_bshd,
+                label=args.get("label"),
+                temperature=args.get("temperature"),
+            )
             output_dict = logits_processor(output_orig, **args)
+            _write_megatron_bshd_debug(
+                "after_logits_processor",
+                label=args.get("label"),
+                log_probs=output_dict.get("log_probs"),
+                entropy=output_dict.get("entropy"),
+                sum_pi_squared=output_dict.get("sum_pi_squared"),
+            )
             output = {
                 k: postprocess_bshd_engine(v, attention_mask_bshd, post_process=post_process)
                 for k, v in output_dict.items()
             }
+            _write_megatron_bshd_debug(
+                "after_postprocess",
+                log_probs=output.get("log_probs"),
+                entropy=output.get("entropy"),
+                sum_pi_squared=output.get("sum_pi_squared"),
+            )
         else:
             output = postprocess_bshd_engine(output_orig, attention_mask_bshd, post_process=post_process)
 

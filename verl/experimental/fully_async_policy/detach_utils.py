@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -22,6 +23,17 @@ import torch
 
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import compute_response_mask
+
+
+def _normalize_param_versions(values, field_name: str):
+    if all(value is not None for value in values):
+        return values
+
+    if os.environ.get("VERL_OMNI_SKIP_WEIGHT_UPDATE", "0").lower() not in {"1", "true", "yes", "on"}:
+        raise ValueError(f"{field_name} contains None outside VERL_OMNI_SKIP_WEIGHT_UPDATE probe mode: {values}")
+
+    print(f"[BatchUtils] {field_name} contains None with VERL_OMNI_SKIP_WEIGHT_UPDATE=1; treating None as cold version 0")
+    return [0 if value is None else value for value in values]
 
 
 @dataclass
@@ -148,8 +160,10 @@ def assemble_batch_from_rollout_samples(
         }
     processing_time_stats = {f"fully_async/{key}": value for key, value in processing_time_stats.items()}
 
-    param_version_start = final_batch.non_tensor_batch["min_global_steps"]
-    param_version_end = final_batch.non_tensor_batch["max_global_steps"]
+    param_version_start = _normalize_param_versions(final_batch.non_tensor_batch["min_global_steps"], "min_global_steps")
+    param_version_end = _normalize_param_versions(final_batch.non_tensor_batch["max_global_steps"], "max_global_steps")
+    final_batch.non_tensor_batch["min_global_steps"] = np.array(param_version_start, dtype=object)
+    final_batch.non_tensor_batch["max_global_steps"] = np.array(param_version_end, dtype=object)
     param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
     num_diff0 = param_version_diff.count(0)
     partial_stats = {

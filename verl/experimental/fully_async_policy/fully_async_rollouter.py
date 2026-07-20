@@ -512,6 +512,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Initialize async queues
         self.pending_queue = asyncio.Queue(maxsize=128)
         self.active_tasks = set()
+        self.feed_exhausted = False
 
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
@@ -843,6 +844,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # End signal
         await self.pending_queue.put(None)
+        async with self.lock:
+            self.feed_exhausted = True
+            self.paused = False
+            self._resume_event.set()
         print(f"[FullyAsyncRollouter][Feed] Sample addition is complete, {self.global_steps} samples have been added")
 
     async def _processor_worker(self):
@@ -850,7 +855,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         Streaming worker coroutines, a sample is submitted for processing without waiting for batches
         """
         while True:
-            if self.paused or await self._should_pause_generation():
+            if (self.paused or await self._should_pause_generation()) and not self.feed_exhausted:
                 print(
                     "[FullyAsyncRollouter][Processor] Received pause signal, waiting for remaining tasks to return..."
                 )
@@ -1076,6 +1081,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def _should_pause_generation(self) -> bool:
         """Determine whether the build should be paused"""
+        if self.feed_exhausted:
+            return False
+
         queue_stats = await self.message_queue_client.get_statistics()
         queue_size = queue_stats["queue_size"]
 

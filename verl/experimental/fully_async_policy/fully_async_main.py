@@ -45,13 +45,51 @@ class FullyAsyncTaskRunner:
 
     def run(self, config):
         print("[ASYNC MAIN] Starting fully async PPO training...")
+        fixed_sequence_score_jsonl = os.environ.get("VERL_OMNI_FIXED_SEQUENCE_SCORE_JSONL", "")
+        if fixed_sequence_score_jsonl:
+            print(
+                "[ASYNC MAIN] VERL_OMNI_FIXED_SEQUENCE_SCORE_JSONL is set; "
+                "running fixed-sequence Megatron scoring probe"
+            )
+            self._initialize_fixed_sequence_components(config)
+            self._run_fixed_sequence_score_probe(fixed_sequence_score_jsonl)
+            return
         self._initialize_components(config)
         self._run_training_loop()
+
+    def _initialize_fixed_sequence_components(self, config) -> None:
+        print(f"[ASYNC MAIN] TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+        pprint(OmegaConf.to_container(config, resolve=True))
+        OmegaConf.resolve(config)
+
+        print("[ASYNC MAIN] Initializing model and tokenizer for fixed-sequence scoring probe...")
+        local_path = copy_to_local(
+            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+        )
+        from verl.utils import hf_processor, hf_tokenizer
+
+        trust_remote_code = config.data.get("trust_remote_code", False)
+        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+
+        self.components["tokenizer"] = tokenizer
+        self.components["processor"] = processor
+        self.components["config"] = config
+
+        print("[ASYNC MAIN] Creating Megatron trainer workers only; rollout/vLLM is intentionally skipped")
+        role_worker_mapping, ray_worker_group_cls = create_role_worker_mapping(config)
+        self.components["role_worker_mapping"] = role_worker_mapping
+        self.components["ray_worker_group_cls"] = ray_worker_group_cls
+        self._create_trainer(config)
+
+        ray.get(self.components["trainer"].load_checkpoint.remote())
+        print("[ASYNC MAIN] Fixed-sequence scoring probe components initialized successfully")
 
     def _initialize_components(self, config) -> None:
         print(f"[ASYNC MAIN] TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        self._validate_rollout_logprob_semantics(config)
 
         print("[ASYNC MAIN] Initializing model and tokenizer...")
         local_path = copy_to_local(
@@ -113,6 +151,29 @@ class FullyAsyncTaskRunner:
             ray.get(self.components["trainer"]._fit_validate.remote(True))
 
         print("[ASYNC MAIN] All components initialized successfully")
+
+    @staticmethod
+    def _validate_rollout_logprob_semantics(config) -> None:
+        actor_config = config.actor_rollout_ref.actor
+        rollout_config = config.actor_rollout_ref.rollout
+        uses_rollout_log_probs = bool(actor_config.get("use_rollout_log_probs", False))
+        calculates_rollout_log_probs = bool(rollout_config.get("calculate_log_probs", False))
+        rollout_logprobs_mode = rollout_config.get("logprobs_mode", "processed_logprobs")
+
+        if uses_rollout_log_probs and not calculates_rollout_log_probs:
+            raise ValueError(
+                "actor.use_rollout_log_probs=True requires "
+                "actor_rollout_ref.rollout.calculate_log_probs=True."
+            )
+        if uses_rollout_log_probs and rollout_logprobs_mode != "raw_logprobs":
+            raise ValueError(
+                "actor.use_rollout_log_probs=True feeds rollout logprobs into PPO ratio/KL, "
+                "so rollout logprobs must be raw full-vocab policy logprobs. "
+                f"Got actor_rollout_ref.rollout.logprobs_mode={rollout_logprobs_mode!r}. "
+                "Set actor_rollout_ref.rollout.logprobs_mode=raw_logprobs and use a raw-logprobs "
+                "vLLM-Omni stage config; processed_logprobs are top-p/temperature-renormalized "
+                "sampling logprobs and are only valid for generation diagnostics."
+            )
 
     def _create_rollouter(self, config) -> None:
         print("[ASYNC MAIN] Starting create rollouter...")
@@ -207,6 +268,26 @@ class FullyAsyncTaskRunner:
         finally:
             asyncio.run(self.components["message_queue_client"].clear_queue())
             print("[ASYNC MAIN] Training completed or interrupted")
+
+    def _run_fixed_sequence_score_probe(self, fixed_sequence_score_jsonl: str):
+        output_path = os.environ.get("VERL_OMNI_FIXED_SEQUENCE_SCORE_OUTPUT", "")
+        raw_rows = os.environ.get("VERL_OMNI_FIXED_SEQUENCE_SCORE_ROWS", "8")
+        try:
+            row_limit = int(raw_rows)
+        except ValueError:
+            row_limit = 8
+        print(
+            "[ASYNC MAIN] Starting fixed-sequence scoring probe "
+            f"input={fixed_sequence_score_jsonl} output={output_path or '<stdout-only>'} rows={row_limit}"
+        )
+        result = ray.get(
+            self.components["trainer"].run_fixed_sequence_score_probe.remote(
+                fixed_sequence_score_jsonl,
+                output_path=output_path,
+                row_limit=row_limit,
+            )
+        )
+        print(f"[ASYNC MAIN] Fixed-sequence scoring probe completed: {result}")
 
 
 @hydra.main(config_path="config", config_name="fully_async_ppo_trainer", version_base=None)
