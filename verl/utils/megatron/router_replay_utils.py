@@ -234,7 +234,13 @@ def _context_parallel_layout(tf_config) -> str:
 
 
 def merge_router_topk_indices(
-    attention_mask, input_ids, mini_layer_topk_idx_list, tf_config, vp_rank=None, local_cp_size=None
+    attention_mask,
+    input_ids,
+    mini_layer_topk_idx_list,
+    tf_config,
+    vp_rank=None,
+    local_cp_size=None,
+    model=None,
 ):
     """
     Merge recorded router top-k indices across sequence-parallel ranks for all router instances,
@@ -250,13 +256,41 @@ def merge_router_topk_indices(
             the current micro-batch.
         vp_rank (Optional[int]): Virtual pipeline stage rank override. If None, the current VP rank from
             Megatron parallel state will be used.
+        model: The forwarded model chunk. When given, routes are collected from its own routers instead
+            of inferring their location in the process-global router registry.
 
     Returns:
         None: The function has side effects only; it appends a tensor of shape
         [1, dynamic_bs_all, layer_num, topk] to mini_layer_topk_idx_list.
     """
     with torch.no_grad():
-        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        vp_rank = 0 if vp_rank is None else vp_rank
+        if model is not None:
+            router_instances_list = [router for _, router in iter_model_routers(model)]
+        else:
+            router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+
+        if not router_instances_list:
+            raise RuntimeError(
+                "router replay RECORD found no routers in the forwarded model: "
+                f"registry={len(RouterReplay.router_instances)}, "
+                f"pp_rank={mpu.get_pipeline_model_parallel_rank()}, vp_rank={vp_rank}"
+            )
+
+        recorded_local_positions = [
+            idx for idx, router in enumerate(router_instances_list) if router.recorded_topk_idx is not None
+        ]
+        missing = [idx for idx, router in enumerate(router_instances_list) if router.recorded_topk_idx is None]
+        if missing:
+            local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
+            raise RuntimeError(
+                "router replay RECORD did not capture all local routers: "
+                f"missing_local_positions={missing}, selected={len(router_instances_list)}, "
+                f"registry={len(RouterReplay.router_instances)}, "
+                f"recorded_local_positions={recorded_local_positions}, local_layer_range={local_rank_info}, "
+                f"pp_rank={mpu.get_pipeline_model_parallel_rank()}, vp_rank={vp_rank}"
+            )
+
         layers_topk_idx = []
         for router in router_instances_list:
             layers_topk_idx.append(router.recorded_topk_idx.to(torch.int16))  # dynamic_bs, topk
@@ -279,8 +313,6 @@ def merge_router_topk_indices(
             if getattr(tf_config, "experimental_attention_variant", None) == "dsv4_hybrid"
             else None
         )
-
-        cp_layout = _context_parallel_layout(tf_config)
 
         if input_ids.is_nested:
             batch_size = input_ids.shape[0]
@@ -403,7 +435,11 @@ def set_router_replay_data(
     Returns:
         None: The function updates internal RouterReplay instances in-place.
     """
+    if layers_topk_idx is None:
+        raise RuntimeError("router_replay REPLAY requires routed_experts from the preceding RECORD forward.")
+
     with torch.no_grad():
+        vp_rank = 0 if vp_rank is None else vp_rank
         fp8 = tf_config.fp8
         use_fp8_padding = fp8 in ["e4m3", "hybrid"]
         cp_layout = _context_parallel_layout(tf_config)
@@ -412,8 +448,6 @@ def set_router_replay_data(
             if getattr(tf_config, "experimental_attention_variant", None) == "dsv4_hybrid"
             else None
         )
-
-        cp_layout = _context_parallel_layout(tf_config)
 
         replay_mask_rmpad = None
         if layers_topk_idx.is_nested:
@@ -460,14 +494,27 @@ def set_router_replay_data(
         index_by_layer = len(layers_topk_idx_reshape) == tf_config.num_layers
 
         if model is not None:
-            for layer_number, router in iter_model_routers(model):
+            model_routers = list(iter_model_routers(model))
+            if not model_routers:
+                raise RuntimeError("router_replay REPLAY found no routers in the forwarded model.")
+
+            missing_layer_numbers = []
+            for layer_number, router in model_routers:
                 layer_idx = layer_number - 1
                 idx = layer_idx if index_by_layer else sum(1 for i in range(layer_idx) if is_moe_layer(tf_config, i))
-                if 0 <= idx < layers_topk_idx_reshape.shape[0]:
-                    router.set_target_indices(
-                        layers_topk_idx_reshape[idx].to(torch.int64),
-                        replay_mask=replay_mask_rmpad_split,
-                    )
+                if not 0 <= idx < layers_topk_idx_reshape.shape[0]:
+                    missing_layer_numbers.append(layer_number)
+                    continue
+                router.set_target_indices(
+                    layers_topk_idx_reshape[idx].to(torch.int64),
+                    replay_mask=replay_mask_rmpad_split,
+                )
+            if missing_layer_numbers:
+                raise RuntimeError(
+                    "router_replay REPLAY data does not cover every forwarded MoE layer: "
+                    f"missing_layer_numbers={missing_layer_numbers}, route_layers={layers_topk_idx_reshape.shape[0]}, "
+                    f"vp_rank={vp_rank}"
+                )
             return
 
         local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
@@ -680,9 +727,8 @@ class RouterReplayHelper:
         Return the list of RouterReplay instances corresponding to the current micro-batch and local
         (pp_rank, vp_stage) layer range.
 
-        When virtual pipeline (VPP) is enabled, the local range for the PP rank is expanded to include
-        all VP stages by multiplying the per-VP count by vp_size. The returned slice is taken from the
-        global RouterReplay.router_instances list.
+        When virtual pipeline (VPP) is enabled, routers for earlier local VP stages precede the
+        current stage in the process-global registry.
 
         Args:
             tf_config: Configuration object used to compute layer assignments.
@@ -691,14 +737,13 @@ class RouterReplayHelper:
         Returns:
             list: A contiguous sublist of RouterReplay.router_instances for the local layer range.
         """
+        if not RouterReplay.router_instances:
+            return []
+
         vp_size = tf_config.virtual_pipeline_model_parallel_size
         if vp_size is not None:
             vp_rank = 0 if vp_rank is None else vp_rank
-            offset = 0
-            for pre_vp_stage in range(vp_size):
-                if pre_vp_stage == vp_rank:
-                    break
-                offset += get_moe_num_layers_to_build(tf_config, pre_vp_stage)
+            offset = sum(get_moe_num_layers_to_build(tf_config, stage) for stage in range(vp_rank))
         else:
             offset = 0
 
@@ -707,36 +752,45 @@ class RouterReplayHelper:
         return router_instances_list
 
     @staticmethod
-    def is_r2_record_action(tf_config, vp_rank=None) -> bool:
+    def _get_action_router_list(tf_config, vp_rank=None, model=None):
+        if model is not None:
+            return [router for _, router in iter_model_routers(model)]
+        return RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+
+    @staticmethod
+    def is_r2_record_action(tf_config, vp_rank=None, model=None) -> bool:
         """Return True if the current router_replay_action is RECORD (R2) for the local router instances.
 
         This inspects the first local RouterReplay instance's router_replay_action and compares it to
         RouterReplayAction.RECORD.
         """
-        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
-        return router_instances_list and router_instances_list[0].router_replay_action == RouterReplayAction.RECORD
+        router_instances_list = RouterReplayHelper._get_action_router_list(tf_config, vp_rank, model)
+        return bool(router_instances_list) and (
+            router_instances_list[0].router_replay_action == RouterReplayAction.RECORD
+        )
 
     @staticmethod
-    def is_replay_forward_action(tf_config, vp_rank=None) -> bool:
+    def is_replay_forward_action(tf_config, vp_rank=None, model=None) -> bool:
         """Return True if the current router_replay_action is REPLAY_FORWARD for the local router instances.
 
         This inspects the first local RouterReplay instance's router_replay_action and compares it to
         RouterReplayAction.REPLAY_FORWARD.
         """
-        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        router_instances_list = RouterReplayHelper._get_action_router_list(tf_config, vp_rank, model)
         return (
-            router_instances_list and router_instances_list[0].router_replay_action == RouterReplayAction.REPLAY_FORWARD
+            bool(router_instances_list)
+            and router_instances_list[0].router_replay_action == RouterReplayAction.REPLAY_FORWARD
         )
 
     @staticmethod
-    def is_replay_backward_action(tf_config, vp_rank=None) -> bool:
+    def is_replay_backward_action(tf_config, vp_rank=None, model=None) -> bool:
         """Return True if the current router_replay_action is REPLAY_BACKWARD for the local router instances.
 
         This inspects the first local RouterReplay instance's router_replay_action and compares it to
         RouterReplayAction.REPLAY_BACKWARD.
         """
-        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+        router_instances_list = RouterReplayHelper._get_action_router_list(tf_config, vp_rank, model)
         return (
-            router_instances_list
+            bool(router_instances_list)
             and router_instances_list[0].router_replay_action == RouterReplayAction.REPLAY_BACKWARD
         )
