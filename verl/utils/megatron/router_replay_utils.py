@@ -784,8 +784,9 @@ class RouterReplayHelper:
         Return the list of RouterReplay instances corresponding to the current micro-batch and local
         (pp_rank, vp_stage) layer range.
 
-        When virtual pipeline (VPP) is enabled, routers for earlier local VP stages precede the
-        current stage in the process-global registry.
+        Accept either one PP rank's complete registry in local VPP order, or one complete
+        model's registry in global layer order. These positional layouts must not contain
+        stale routers or routers from other models; use the model-scoped helpers for those cases.
 
         Args:
             tf_config: Configuration object used to compute layer assignments.
@@ -797,22 +798,27 @@ class RouterReplayHelper:
         if not RouterReplay.router_instances:
             return []
 
-        vp_size = tf_config.virtual_pipeline_model_parallel_size
-        if vp_size is not None:
-            vp_rank = 0 if vp_rank is None else vp_rank
-            offset = sum(get_moe_num_layers_to_build(tf_config, stage) for stage in range(vp_rank))
-        else:
-            offset = 0
+        vp_size = tf_config.virtual_pipeline_model_parallel_size or 1
+        vp_rank = 0 if vp_rank is None else vp_rank
+        if not 0 <= vp_rank < vp_size:
+            raise ValueError(f"vp_rank={vp_rank} is outside the configured VPP size {vp_size}.")
 
-        num_layers_to_build = get_moe_num_layers_to_build(tf_config, vp_rank)
-        router_instances_list = RouterReplay.router_instances[offset : offset + num_layers_to_build]
-        if len(router_instances_list) != num_layers_to_build:
+        local_counts = [get_moe_num_layers_to_build(tf_config, stage) for stage in range(vp_size)]
+        local_total = sum(local_counts)
+        global_total = sum(is_moe_layer(tf_config, idx) for idx in range(tf_config.num_layers))
+        registry_size = len(RouterReplay.router_instances)
+        if registry_size == local_total:
+            offset = sum(local_counts[:vp_rank])
+        elif registry_size == global_total:
+            layer_start = get_current_rank_layer_info(tf_config, vp_rank)["start"]
+            offset = sum(is_moe_layer(tf_config, idx) for idx in range(layer_start))
+        else:
             raise RuntimeError(
-                "router replay registry does not cover the current PP/VPP stage: "
-                f"registry={len(RouterReplay.router_instances)}, offset={offset}, "
-                f"expected={num_layers_to_build}, actual={len(router_instances_list)}, vp_rank={vp_rank}"
+                "router replay registry does not cover a complete local PP/VPP or global model layout: "
+                f"registry={registry_size}, local_expected={local_total}, global_expected={global_total}, "
+                f"vp_rank={vp_rank}. Use model-scoped replay for non-positional registries."
             )
-        return router_instances_list
+        return RouterReplay.router_instances[offset : offset + local_counts[vp_rank]]
 
     @staticmethod
     def _get_action_router_list(tf_config, vp_rank=None, model=None):

@@ -113,6 +113,93 @@ def test_get_micro_batch_router_list_rejects_short_nonempty_registry(monkeypatch
         rr_utils.RouterReplayHelper.get_micro_batch_router_list(tf_config)
 
 
+@pytest.mark.parametrize("frequency", [1, [0, 1, 0, 0, 1, 0, 1, 1], [0] * 8])
+@pytest.mark.parametrize("vpp_size", [None, 2])
+@pytest.mark.parametrize("pp_rank", [0, 1])
+@pytest.mark.parametrize("registry_layout", ["local", "global"])
+def test_registry_layouts_select_exact_moe_layers(monkeypatch, frequency, vpp_size, pp_rank, registry_layout):
+    config = _config(num_layers=8, moe_layer_freq=frequency, virtual_pipeline_model_parallel_size=vpp_size)
+
+    def layer_range(vp_rank):
+        width = 8 // (2 * (vpp_size or 1))
+        start = ((vp_rank or 0) * 2 + pp_rank) * width
+        return {"start": start, "end": start + width}
+
+    def stage_layers(vp_rank):
+        bounds = layer_range(vp_rank)
+        return [idx for idx in range(bounds["start"], bounds["end"]) if rr_utils.is_moe_layer(config, idx)]
+
+    monkeypatch.setattr(rr_utils, "get_current_rank_layer_info", lambda _config, vp_rank=None: layer_range(vp_rank))
+    monkeypatch.setattr(
+        rr_utils, "get_moe_num_layers_to_build", lambda _config, vp_rank=None: len(stage_layers(vp_rank))
+    )
+    RouterReplay.router_instances = (
+        [idx for idx in range(8) if rr_utils.is_moe_layer(config, idx)]
+        if registry_layout == "global"
+        else [idx for vp_rank in range(vpp_size or 1) for idx in stage_layers(vp_rank)]
+    )
+
+    for vp_rank in range(vpp_size or 1):
+        assert rr_utils.RouterReplayHelper.get_micro_batch_router_list(config, vp_rank) == stage_layers(vp_rank)
+
+
+@pytest.mark.parametrize("registry_size", [1, 3, 5, 9])
+def test_registry_rejects_incomplete_or_extra_model_layout(monkeypatch, registry_size):
+    config = _config(num_layers=8, virtual_pipeline_model_parallel_size=2)
+    RouterReplay.router_instances = list(range(registry_size))
+    monkeypatch.setattr(rr_utils, "get_moe_num_layers_to_build", lambda _config, vp_rank=None: 2)
+
+    with pytest.raises(RuntimeError, match="registry does not cover"):
+        rr_utils.RouterReplayHelper.get_micro_batch_router_list(config, vp_rank=0)
+
+
+@pytest.mark.parametrize("vp_rank", [-1, 2])
+def test_registry_rejects_invalid_vp_rank(vp_rank):
+    RouterReplay.router_instances = list(range(4))
+    config = _config(num_layers=8, virtual_pipeline_model_parallel_size=2)
+    with pytest.raises(ValueError, match="outside the configured VPP size"):
+        rr_utils.RouterReplayHelper.get_micro_batch_router_list(config, vp_rank)
+
+
+@pytest.mark.parametrize("registry_layout", ["local", "global"])
+@pytest.mark.parametrize("frequency", [1, [0, 1, 0, 0, 1, 0, 1, 1]])
+def test_positional_record_and_replay_use_the_same_routers(monkeypatch, registry_layout, frequency):
+    config = _config(num_layers=8, moe_layer_freq=frequency, virtual_pipeline_model_parallel_size=2)
+    global_layers = [idx for idx in range(8) if rr_utils.is_moe_layer(config, idx)]
+    local_layers = [idx for idx in global_layers if idx in (2, 3, 6, 7)]
+    registered_layers = local_layers if registry_layout == "local" else global_layers
+    routers = {
+        idx: _FakeRouter(torch.full((3, 2), 256 + idx, dtype=torch.int64), RouterReplayAction.RECORD)
+        for idx in registered_layers
+    }
+    RouterReplay.router_instances = list(routers.values())
+    monkeypatch.setattr(rr_utils, "device_name", "cpu")
+    monkeypatch.setattr(rr_utils, "get_current_rank_layer_info", lambda _config, vp_rank=None: {"start": 6, "end": 8})
+    monkeypatch.setattr(
+        rr_utils,
+        "get_moe_num_layers_to_build",
+        lambda _config, vp_rank=None: sum(idx in ((2, 3) if vp_rank == 0 else (6, 7)) for idx in global_layers),
+    )
+    monkeypatch.setattr(rr_utils, "gather_from_sequence_parallel_region", lambda tensor, **_kwargs: tensor)
+    monkeypatch.setattr(rr_utils, "scatter_to_sequence_parallel_region", lambda tensor: tensor)
+    monkeypatch.setattr(rr_utils, "preprocess_packed_seqs", lambda tensor, *_args, **_kwargs: (tensor, object()))
+    monkeypatch.setattr(rr_utils, "postprocess_packed_seqs", lambda tensor, *_args, **_kwargs: tensor)
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    recorded = []
+    rr_utils.merge_router_topk_indices(mask, torch.ones(1, 3, dtype=torch.long), recorded, config, vp_rank=1)
+    expected_local = torch.stack([routers[idx].recorded_topk_idx for idx in (6, 7)], dim=1).unsqueeze(0)
+    assert recorded[0].dtype == torch.int16
+    torch.testing.assert_close(recorded[0], expected_local.to(torch.int16))
+
+    global_routes = torch.stack([torch.full((3, 2), 256 + idx) for idx in global_layers], dim=1).unsqueeze(0)
+    rr_utils.set_router_replay_data(global_routes, mask, config, vp_rank=1)
+    for idx, router in routers.items():
+        if idx in (6, 7):
+            torch.testing.assert_close(router.target_topk_idx, router.recorded_topk_idx)
+        else:
+            assert router.target_topk_idx is None
+
+
 def test_merge_router_topk_indices_uses_forwarded_model_with_leftover_vpp_recordings(monkeypatch):
     stale_a = torch.tensor([[12, 13], [14, 15], [16, 17]], dtype=torch.int64)
     stale_b = torch.tensor([[18, 19], [20, 21], [22, 23]], dtype=torch.int64)
