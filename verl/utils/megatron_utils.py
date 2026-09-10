@@ -251,7 +251,7 @@ def get_model(
     return model
 
 
-_HF_CONFIG_CHILD_NAMES = ("text_config", "thinker_config", "model_config", "language_config")
+_HF_CONFIG_CHILD_NAMES = ("text_config", "language_config", "thinker_config", "model_config")
 
 
 def _get_hf_text_config(hf_config: PretrainedConfig):
@@ -264,28 +264,27 @@ def _get_hf_text_config(hf_config: PretrainedConfig):
 
 
 def _iter_hf_config_tree(hf_config: PretrainedConfig):
-    config_queue = [hf_config]
     seen = set()
-    while config_queue:
-        config = config_queue.pop(0)
-        if id(config) in seen:
-            continue
-        seen.add(id(config))
-        yield config
 
-        # Prefer the model's canonical text config over multimodal siblings such
-        # as an audio decoder, which may expose conflicting model attributes.
+    def _visit(config):
+        if id(config) in seen:
+            return
+        seen.add(id(config))
+
+        # Visit the canonical text config and known language-model wrappers before
+        # the composite root. Never walk arbitrary sub_configs: audio/code2wav
+        # siblings can expose conflicting model attributes.
         text_config = _get_hf_text_config(config)
         if text_config is not None and text_config is not config:
-            config_queue.append(text_config)
+            yield from _visit(text_config)
 
-        sub_configs = getattr(type(config), "sub_configs", {}) or {}
-        child_names = list(sub_configs)
-        child_names.extend(name for name in _HF_CONFIG_CHILD_NAMES if name not in child_names)
-        for child_name in child_names:
+        for child_name in _HF_CONFIG_CHILD_NAMES:
             child_config = getattr(config, child_name, None)
             if child_config is not None and child_config is not text_config:
-                config_queue.append(child_config)
+                yield from _visit(child_config)
+        yield config
+
+    yield from _visit(hf_config)
 
 
 def get_hf_config_attr(hf_config: PretrainedConfig, attr_name: str) -> Any:

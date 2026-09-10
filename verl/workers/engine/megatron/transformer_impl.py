@@ -920,8 +920,17 @@ class MegatronEngine(BaseEngine):
         # compute input shapes for pp stages
         n_micro_batch = len(micro_batches)
 
+        enable_routing_replay = tu.get_non_tensor_data(data, key="enable_routing_replay", default=False)
+        record_r2_routes = (
+            enable_routing_replay
+            and forward_only
+            and self.engine_config.router_replay.mode == "R2"
+            and data.get("routed_experts", None) is None
+        )
+
         for micro_batch in micro_batches:
             tu.assign_non_tensor(micro_batch, num_micro_batch=n_micro_batch)
+            tu.assign_non_tensor(micro_batch, record_r2_routes=record_r2_routes)
             if global_max_seqlen is not None:
                 tu.assign_non_tensor(micro_batch, forced_max_seqlen=global_max_seqlen)
 
@@ -939,14 +948,6 @@ class MegatronEngine(BaseEngine):
             self.forward_step,
             logits_processor_func=loss_function,
             postprocess_micro_batch_func=postprocess_micro_batch_func,
-        )
-
-        enable_routing_replay = tu.get_non_tensor_data(data, key="enable_routing_replay", default=False)
-        record_r2_routes = (
-            enable_routing_replay
-            and forward_only
-            and self.engine_config.router_replay.mode == "R2"
-            and data.get("routed_experts", None) is None
         )
 
         if enable_routing_replay:
@@ -1413,9 +1414,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
             )
 
         # Router replay: record routing decisions for R2 mode
-        if self.enable_routing_replay and RouterReplayHelper.is_r2_record_action(
-            self.tf_config, vp_rank, model=unwrapped_model
-        ):
+        if tu.get_non_tensor_data(batch, key="record_r2_routes", default=False):
             merge_router_topk_indices(
                 attention_mask,
                 input_ids,

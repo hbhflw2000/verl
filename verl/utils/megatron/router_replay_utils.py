@@ -264,18 +264,45 @@ def merge_router_topk_indices(
         [1, dynamic_bs_all, layer_num, topk] to mini_layer_topk_idx_list.
     """
     with torch.no_grad():
+        if not input_ids.is_nested and attention_mask is None:
+            raise RuntimeError("router replay RECORD requires attention_mask for non-nested BSHD inputs.")
         vp_rank = 0 if vp_rank is None else vp_rank
         if model is not None:
-            router_instances_list = [router for _, router in iter_model_routers(model)]
+            model_routers = sorted(iter_model_routers(model), key=lambda item: item[0])
+            layer_numbers = [layer_number for layer_number, _ in model_routers]
+            if len(layer_numbers) != len(set(layer_numbers)):
+                raise RuntimeError(
+                    "router replay RECORD found duplicate layer numbers in the forwarded model: "
+                    f"layer_numbers={layer_numbers}, vp_rank={vp_rank}"
+                )
+            router_instances_list = [router for _, router in model_routers]
         else:
             router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
 
         if not router_instances_list:
-            raise RuntimeError(
-                "router replay RECORD found no routers in the forwarded model: "
-                f"registry={len(RouterReplay.router_instances)}, "
-                f"pp_rank={mpu.get_pipeline_model_parallel_rank()}, vp_rank={vp_rank}"
-            )
+            expected = get_moe_num_layers_to_build(tf_config, vp_rank)
+            if expected:
+                raise RuntimeError(
+                    "router replay RECORD found no routers in a stage that expects MoE layers: "
+                    f"expected={expected}, vp_rank={vp_rank}"
+                )
+            topk = getattr(tf_config, "moe_router_topk", None)
+            if not isinstance(topk, int) or topk <= 0:
+                raise RuntimeError(
+                    "router replay RECORD cannot build an empty local route map without a positive "
+                    f"moe_router_topk, got {topk!r}."
+                )
+            if input_ids.is_nested:
+                empty_routes = [
+                    torch.empty((tokens.shape[0], 0, topk), dtype=torch.int16) for tokens in input_ids.unbind()
+                ]
+                mini_layer_topk_idx_list.append(torch.nested.as_nested_tensor(empty_routes, layout=torch.jagged))
+            else:
+                batch_size, seq_len = attention_mask.shape[:2]
+                mini_layer_topk_idx_list.append(
+                    torch.empty((batch_size, seq_len, 0, topk), dtype=torch.int16, device="cpu")
+                )
+            return
 
         recorded_local_positions = [
             idx for idx, router in enumerate(router_instances_list) if router.recorded_topk_idx is not None
@@ -469,6 +496,8 @@ def set_router_replay_data(
                     cp_layout=cp_layout,
                 )
         else:
+            if attention_mask is None:
+                raise RuntimeError("router replay REPLAY requires attention_mask for non-nested BSHD inputs.")
             layers_topk_idx_rmpad, _ = preprocess_packed_seqs(
                 layers_topk_idx, attention_mask, pre_process=True, use_fp8_padding=use_fp8_padding
             )
@@ -598,6 +627,11 @@ def reorder_and_merge_vpp_layers(
     """
     # 1) Build schedule table: map each virtual_microbatch_id -> (microbatch_id, model_chunk_id)
     schedule_table = get_schedule_table(num_microbatches, vpp_size, microbatch_group_size_per_vp_stage)
+    if len(micro_batch_tensor_list) != len(schedule_table):
+        raise RuntimeError(
+            "R2 RECORD must capture every scheduled microbatch/chunk, including zero-layer chunks: "
+            f"captured={len(micro_batch_tensor_list)}, expected={len(schedule_table)}"
+        )
 
     # 2) Group by model_chunk_id to build reorder indices so entries of the same chunk become contiguous along dim 0
     tensor_by_chunk = [[] for _ in range(vpp_size)]
@@ -655,7 +689,6 @@ def get_current_rank_layer_info(tf_config, vp_rank=None):
 
 
 def pp_gather(local_layers_router_map, tf_config):
-    # TODO: Consider non-uniform layer allocation cases.
     """
     Gather local router maps from all PP ranks into a global router map.
 
@@ -673,6 +706,8 @@ def pp_gather(local_layers_router_map, tf_config):
 
     pp_group = mpu.get_pipeline_model_parallel_group()
     world_size = torch.distributed.get_world_size(pp_group)
+    if world_size != pp_size:
+        raise RuntimeError(f"pipeline group size {world_size} does not match configured PP size {pp_size}.")
     if local_layers_router_map.is_nested:
         # all_gather_object preserves each sender's CUDA device, so normalize
         # jagged route maps before concatenating routes from local PP ranks.
@@ -680,18 +715,40 @@ def pp_gather(local_layers_router_map, tf_config):
         layers_topk_idx_global_list = [None] * world_size
         torch.distributed.all_gather_object(layers_topk_idx_global_list, local_layers_router_map, pp_group)
     else:
-        # NCCL has no int16 datatype, so gather a bit-identical uint8 view and undo it
-        # before the layer-dimension concat below. The nested branch above needs none
-        # of this: all_gather_object pickles the tensor.
+        # PP stages may own different numbers of MoE layers, including zero. Exchange
+        # layer counts, pad only that dimension for NCCL, then remove the padding.
+        # NCCL has no int16 datatype, so payloads travel as bit-identical uint8 views.
         payload = local_layers_router_map.to(device_name).contiguous().view(torch.uint8)
-        layers_topk_idx_global_list = [torch.empty_like(payload) for _ in range(world_size)]
+        local_layer_count = torch.tensor([local_layers_router_map.shape[2]], dtype=torch.int64, device=payload.device)
+        gathered_layer_counts = [torch.empty_like(local_layer_count) for _ in range(world_size)]
         torch.distributed.all_gather(
-            tensor=payload,
-            tensor_list=layers_topk_idx_global_list,
+            tensor=local_layer_count,
+            tensor_list=gathered_layer_counts,
             group=pp_group,
             async_op=False,
         )
-        layers_topk_idx_global_list = [t.view(torch.int16) for t in layers_topk_idx_global_list]
+        layer_counts = [int(count.item()) for count in gathered_layer_counts]
+        max_layer_count = max(layer_counts)
+        if max_layer_count == 0:
+            layers_topk_idx_global_list = [local_layers_router_map for _ in range(world_size)]
+        else:
+            if payload.shape[2] != max_layer_count:
+                padded_shape = list(payload.shape)
+                padded_shape[2] = max_layer_count
+                padded_payload = torch.zeros(padded_shape, dtype=payload.dtype, device=payload.device)
+                padded_payload[:, :, : payload.shape[2], :].copy_(payload)
+                payload = padded_payload
+            gathered_payloads = [torch.empty_like(payload) for _ in range(world_size)]
+            torch.distributed.all_gather(
+                tensor=payload,
+                tensor_list=gathered_payloads,
+                group=pp_group,
+                async_op=False,
+            )
+            layers_topk_idx_global_list = [
+                tensor[:, :, :layer_count, :].contiguous().view(torch.int16)
+                for tensor, layer_count in zip(gathered_payloads, layer_counts, strict=True)
+            ]
     vp_size = tf_config.virtual_pipeline_model_parallel_size
     if vp_size is not None:
         vpp_router_map_offset = [[] for _ in range(pp_size)]
@@ -749,6 +806,12 @@ class RouterReplayHelper:
 
         num_layers_to_build = get_moe_num_layers_to_build(tf_config, vp_rank)
         router_instances_list = RouterReplay.router_instances[offset : offset + num_layers_to_build]
+        if len(router_instances_list) != num_layers_to_build:
+            raise RuntimeError(
+                "router replay registry does not cover the current PP/VPP stage: "
+                f"registry={len(RouterReplay.router_instances)}, offset={offset}, "
+                f"expected={num_layers_to_build}, actual={len(router_instances_list)}, vp_rank={vp_rank}"
+            )
         return router_instances_list
 
     @staticmethod

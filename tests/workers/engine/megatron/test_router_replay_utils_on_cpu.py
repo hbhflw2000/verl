@@ -47,6 +47,7 @@ def _config(num_layers=48, moe_layer_freq=1, virtual_pipeline_model_parallel_siz
     return SimpleNamespace(
         fp8=None,
         moe_layer_freq=moe_layer_freq,
+        moe_router_topk=2,
         num_layers=num_layers,
         pipeline_model_parallel_size=2,
         virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
@@ -102,6 +103,16 @@ def test_get_micro_batch_router_list_supports_local_only_vpp_registry(monkeypatc
     assert rr_utils.RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank=1) == [2, 3]
 
 
+def test_get_micro_batch_router_list_rejects_short_nonempty_registry(monkeypatch):
+    RouterReplay.router_instances = [object()]
+    tf_config = _config(num_layers=4)
+
+    monkeypatch.setattr(rr_utils, "get_moe_num_layers_to_build", lambda _config, _vp_rank=None: 2)
+
+    with pytest.raises(RuntimeError, match="registry does not cover"):
+        rr_utils.RouterReplayHelper.get_micro_batch_router_list(tf_config)
+
+
 def test_merge_router_topk_indices_uses_forwarded_model_with_leftover_vpp_recordings(monkeypatch):
     stale_a = torch.tensor([[12, 13], [14, 15], [16, 17]], dtype=torch.int64)
     stale_b = torch.tensor([[18, 19], [20, 21], [22, 23]], dtype=torch.int64)
@@ -125,7 +136,7 @@ def test_merge_router_topk_indices_uses_forwarded_model_with_leftover_vpp_record
     monkeypatch.setattr(
         rr_utils,
         "iter_model_routers",
-        lambda model: iter([(1, RouterReplay.router_instances[2]), (2, RouterReplay.router_instances[5])]),
+        lambda model: iter([(2, RouterReplay.router_instances[5]), (1, RouterReplay.router_instances[2])]),
     )
     monkeypatch.setattr(rr_utils, "gather_from_sequence_parallel_region", lambda tensor, **_kwargs: tensor)
     monkeypatch.setattr(
@@ -152,6 +163,75 @@ def test_merge_router_topk_indices_uses_forwarded_model_with_leftover_vpp_record
     assert merged[0].shape == (1, 3, 2, 2)
     assert torch.equal(merged[0][0, :, 0, :], recorded_a.to(torch.uint8))
     assert torch.equal(merged[0][0, :, 1, :], recorded_b.to(torch.uint8))
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_merge_router_topk_indices_emits_zero_layer_map_for_dense_stage(monkeypatch, nested):
+    tf_config = _config(num_layers=2)
+    if nested:
+        input_ids = torch.nested.as_nested_tensor([torch.ones(3, dtype=torch.int64)], layout=torch.jagged)
+        attention_mask = None
+    else:
+        input_ids = torch.ones(1, 3, dtype=torch.int64)
+        attention_mask = torch.ones(1, 3, dtype=torch.bool)
+    merged = []
+
+    monkeypatch.setattr(rr_utils, "iter_model_routers", lambda _model: iter(()))
+    monkeypatch.setattr(rr_utils, "get_moe_num_layers_to_build", lambda *_args: 0)
+
+    rr_utils.merge_router_topk_indices(
+        attention_mask,
+        input_ids,
+        merged,
+        tf_config,
+        model=object(),
+    )
+
+    assert len(merged) == 1
+    assert merged[0].dtype == torch.int16
+    assert merged[0].shape[0] == 1
+    assert merged[0].shape[2:] == (0, 2)
+    if nested:
+        assert merged[0].is_nested
+        assert merged[0].unbind()[0].shape == (3, 0, 2)
+    else:
+        assert merged[0].shape == (1, 3, 0, 2)
+
+
+def test_merge_router_topk_indices_requires_bshd_attention_mask(monkeypatch):
+    router = _FakeRouter(torch.ones(3, 2, dtype=torch.int64))
+    tf_config = _config(num_layers=1)
+
+    monkeypatch.setattr(rr_utils, "device_name", "cpu")
+    monkeypatch.setattr(rr_utils, "iter_model_routers", lambda _model: iter([(1, router)]))
+    monkeypatch.setattr(rr_utils, "gather_from_sequence_parallel_region", lambda tensor, **_kwargs: tensor)
+
+    with pytest.raises(RuntimeError, match="RECORD requires attention_mask"):
+        rr_utils.merge_router_topk_indices(
+            None,
+            torch.ones(1, 3, dtype=torch.int64),
+            [],
+            tf_config,
+            model=object(),
+        )
+
+
+def test_empty_model_does_not_hide_missing_moe_routers(monkeypatch):
+    monkeypatch.setattr(rr_utils, "iter_model_routers", lambda _model: iter(()))
+    monkeypatch.setattr(rr_utils, "get_moe_num_layers_to_build", lambda *_args: 2)
+    with pytest.raises(RuntimeError, match="stage that expects MoE layers"):
+        rr_utils.merge_router_topk_indices(
+            torch.ones(1, 3, dtype=torch.bool), torch.ones(1, 3, dtype=torch.long), [], _config(), model=object()
+        )
+
+
+def test_record_rejects_duplicate_layer_numbers(monkeypatch):
+    routers = [(1, _FakeRouter()), (1, _FakeRouter())]
+    monkeypatch.setattr(rr_utils, "iter_model_routers", lambda _model: iter(routers))
+    with pytest.raises(RuntimeError, match="duplicate layer numbers"):
+        rr_utils.merge_router_topk_indices(
+            torch.ones(1, 3, dtype=torch.bool), torch.ones(1, 3, dtype=torch.long), [], _config(), model=object()
+        )
 
 
 def test_merge_router_topk_indices_hard_fails_when_record_count_mismatches(monkeypatch):
@@ -234,6 +314,13 @@ def test_set_router_replay_data_uses_forwarded_vp_model(monkeypatch):
 def test_set_router_replay_data_rejects_missing_routes():
     with pytest.raises(RuntimeError, match="requires routed_experts"):
         rr_utils.set_router_replay_data(None, torch.ones(1, 1, dtype=torch.bool), _config())
+
+
+def test_set_router_replay_data_requires_bshd_attention_mask():
+    routes = torch.ones(1, 3, 1, 2, dtype=torch.int16)
+
+    with pytest.raises(RuntimeError, match="REPLAY requires attention_mask"):
+        rr_utils.set_router_replay_data(routes, None, _config(num_layers=1), model=object())
 
 
 def test_set_router_replay_data_rejects_incomplete_model_routes(monkeypatch):

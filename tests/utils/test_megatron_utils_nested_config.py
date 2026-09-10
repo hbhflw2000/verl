@@ -75,6 +75,27 @@ def test_get_hf_config_attr_prefers_direct_text_config_over_root():
     assert get_hf_config_attr(config, "hidden_size") == 4096
 
 
+def test_nested_config_lookup_does_not_fall_back_to_multimodal_sibling():
+    class CompositeConfig:
+        sub_configs = {"audio_config": object, "code2wav_config": object}
+
+        def __init__(self):
+            self.audio_config = SimpleNamespace(hidden_size=1024)
+            self.code2wav_config = SimpleNamespace(rope_theta=10_000.0)
+
+    with pytest.raises(AttributeError, match="has no nested hidden_size"):
+        get_hf_config_attr(CompositeConfig(), "hidden_size")
+    with pytest.raises(AttributeError, match="has no rope_theta"):
+        get_hf_rope_theta(CompositeConfig())
+
+
+def test_get_hf_config_attr_preserves_falsey_text_values():
+    config = SimpleNamespace(text_config=SimpleNamespace(flag=False, count=0))
+
+    assert get_hf_config_attr(config, "flag") is False
+    assert get_hf_config_attr(config, "count") == 0
+
+
 def test_nested_config_lookup_rejects_missing_attributes():
     config = SimpleNamespace(text_config=SimpleNamespace())
 
